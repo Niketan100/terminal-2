@@ -1,7 +1,28 @@
+import React from 'react'
 import { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { useDeltaWS } from './useDeltaWS.js';
 import { CandleChart, SubChart, OrderBookChart, Sparkline, AggressionChart, PriceScale } from './charts.jsx';
-import Live5mPanel from './components/Live5mPanel.jsx';
+
+// Small left-panel widget: recent trades in last 5 minutes
+function Live5mPanel({ trades = [], bids = [], asks = [], now }) {
+  const recent = useMemo(() => trades.filter(t => t.tms && t.tms >= now - 5 * 60 * 1000), [trades, now]);
+  const buys = recent.filter(t => t.side === 'buy').length;
+  const sells = recent.filter(t => t.side === 'sell').length;
+  const lastPrice = trades.length ? trades[0].price : null;
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+      <div style={{ display:'flex', justifyContent:'space-between', fontSize:11 }}>
+        <div style={{ color:'#9ddfff', fontWeight:700 }}>{buys}▲</div>
+        <div style={{ color:'#9ddfff', fontWeight:700 }}>{sells}▼</div>
+        <div style={{ color:'#bfefff', fontWeight:800 }}>{lastPrice ? `$${lastPrice.toFixed(1)}` : '–'}</div>
+      </div>
+      <div style={{ height: 64 }}>
+        <AggressionChart trades={recent} bids={bids} asks={asks} recent={120} compact={true} />
+      </div>
+    </div>
+  );
+}
 import { rsi, macd, bb, findSR, analyzeSetup, vwap } from './indicators.js';
 
 const STATUS_COLOR = {
@@ -52,11 +73,15 @@ export default function Terminal() {
   const [cmd, setCmd] = useState('');
   const [priceHist] = useState([]);
 
-  // panning
+  // panning: X-axis (time) and Y-axis (price)
   const [pan, setPan] = useState(0);
   const panRef = useRef(0);
+  const [yPan, setYPan] = useState(0);
+  const yPanRef = useRef(0);
   const startPanXRef = useRef(0);
+  const startPanYRef = useRef(0);
   const startPanValRef = useRef(0);
+  const startYPanValRef = useRef(0);
   const mainRef = useRef(null);
   const isPanningRef = useRef(false);
 
@@ -79,10 +104,6 @@ export default function Terminal() {
   const [yZoom, setYZoom] = useState(() => { try { return parseFloat(localStorage.getItem('dt.yZoom')) || 1; } catch { return 1; } });
   const [glowEnabled, setGlowEnabled] = useState(() => { try { return JSON.parse(localStorage.getItem('dt.glowEnabled') ?? 'true'); } catch { return true; } });
   const [showBackups, setShowBackups] = useState(false);
-  
-  const [yPan, setYPan] = useState(0); 
-  const yPanRef = useRef(0);
-  const chartStatsRef = useRef({ min: 0, max: 1 });
 
   const [demoBalance, setDemoBalance] = useState(10000);
   const [leverage, setLeverage] = useState(200);
@@ -119,51 +140,27 @@ export default function Terminal() {
     }
   };
 
-  const candlesStart = Math.max(0, nTotal - zoom - pan);
-  const start = candlesStart; // alias
-  const visible = useMemo(() => candles.slice(start, Math.min(nTotal, start + zoom)), [candles, start, nTotal, zoom]);
+  const start = Math.max(0, nTotal - zoom - pan);
+  const visible = candles.slice(start, Math.min(nTotal, start + zoom));
 
   const allVwap = useMemo(() => vwap(candles, 90), [candles]);
-  const visibleVwap = useMemo(() => allVwap.slice(start, Math.min(nTotal, start + zoom)), [allVwap, start, nTotal, zoom]);
+  const visibleVwap = allVwap.slice(start, Math.min(nTotal, start + zoom));
 
   // Determine min/max price for the visible window
   // Include BB if active, for consistency
-  const { baseMin, baseMax } = useMemo(() => {
-    let min = Infinity, max = -Infinity;
-    if (!visible || visible.length === 0) return { baseMin: 0, baseMax: 1 };
-    
-    // 1. Candles
-    for (let i = 0; i < visible.length; i++) {
-        const c = visible[i];
-        if (c.h > max) max = c.h;
-        if (c.l < min) min = c.l;
-    }
-    
-    // 2. BB if enabled (BB calculation is O(n), so only do if needed and memoized separately ideally, 
-    // but here we are inside visible memo so it's consistent)
-    if (ind.bb && visible.length > 20) {
-      const closes = visible.map(c => c.c);
-      const bands = bb(closes);
-      for (let i = 0; i < bands.length; i++) {
-          const b = bands[i];
-          if (b) {
-              if (b.u > max) max = b.u;
-              if (b.l < min) min = b.l;
-          }
-      }
-    }
-    
-    if (min === Infinity) { min = 0; max = 1; }
-    
-    return { baseMin: min * 0.9985, baseMax: max * 1.0015 };
-  }, [visible, ind.bb]);
-
+  const allPrices = visible.flatMap(c => [c.h, c.l]);
+  if (ind.bb) {
+     const bands = bb(visible.map(c => c.c));
+     bands.forEach(b => b && allPrices.push(b.u, b.l));
+  }
+  let baseMin = Math.min(...allPrices) * 0.9985;
+  let baseMax = Math.max(...allPrices) * 1.0015;
+  
+  // Apply Y-pan offset to move the price range up/down
   const minPrice = baseMin + yPan;
   const maxPrice = baseMax + yPan;
-  
-  chartStatsRef.current = { range: baseMax - baseMin, yZoom };
 
-  const visMeta = useMemo(() => ({ start, padLeft, padRight, z: zoom }), [start, padLeft, padRight, zoom]);
+  const visMeta = { start, padLeft, padRight, z: zoom };
 
   // small indicators for live readouts
   const closes = visible.map(c => c.c || 0);
@@ -312,7 +309,7 @@ export default function Terminal() {
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `delta_account_${new Date().toISOString().slice(0,19).replace(/[:T]/g,'-')}.json`;
+      a.download = `niketa_account_${new Date().toISOString().slice(0,19).replace(/[:T]/g,'-')}.json`;
       a.click();
       URL.revokeObjectURL(url);
       log('Exported account snapshot', 'info');
@@ -539,46 +536,31 @@ export default function Terminal() {
     });
   }, [setZoom, setYZoom]);
 
-  // Start panning on mousedown inside main chart area
+  // Start panning on mousedown inside main chart area (both X and Y)
   const onMainMouseDown = useCallback(e => {
     if (e.button !== 0) return; // only left button
     isPanningRef.current = true;
     startPanXRef.current = e.clientX;
+    startPanYRef.current = e.clientY;
     startPanValRef.current = panRef.current;
-    
-    // Y-pan setup
-    const startY = e.clientY;
-    const startYPan = yPanRef.current;
-    
-    // Calculate pixels to price ratio
-    let scale = 1;
-    try {
-      const rect = e.currentTarget.getBoundingClientRect();
-      const cH = Math.max(1, rect.height - 14 - 22);
-      scale = chartStatsRef.current.range / (chartStatsRef.current.yZoom || 1) / cH;
-    } catch { /* ignore */ }
-
-    // set up panning handlers for the main chart
+    startYPanValRef.current = yPanRef.current;
+    // set up panning handlers for the main chart (X and Y)
     const startPanX = startPanXRef.current;
+    const startPanY = startPanYRef.current;
     const startPanVal = startPanValRef.current;
-    
+    const startYPanVal = startYPanValRef.current;
     const onMove = mv => {
-      // X Pan
+      // X-axis panning (time/horizontal)
       const dx = Math.round((mv.clientX - startPanX) / 6); // slowdown factor for smoother pan
-      const next = Math.max(0, startPanVal + dx);
-      panRef.current = next;
-      setPan(next);
+      const nextPan = Math.max(0, startPanVal + dx);
+      panRef.current = nextPan;
+      setPan(nextPan);
       
-      // Y Pan
-      // Drag down (positive dy) should move view UP (increase yPan) to see higher prices?
-      // No... if I drag down, I want to pull the chart down.
-      // If charts moves down, prices at top (high) move to middle.
-      // So center price increases.
-      // So yPan increases. 
-      const dy = mv.clientY - startY; 
-      const nextY = startYPan + (dy * scale);
-      yPanRef.current = nextY;
-      setYPan(nextY);
+      // Y-axis panning (price/vertical) - drag down to move price up, drag up to move price down
+      const dy = mv.clientY - startPanY;
+      const nextYPan = startYPanVal + dy * 0.5; // scale for comfortable dragging
+      yPanRef.current = nextYPan;
+      setYPan(nextYPan);
     };
     const onUp = () => {
       isPanningRef.current = false;
@@ -767,8 +749,8 @@ export default function Terminal() {
       <header style={S.header}>
         <div style={S.brand}>
           <div style={{ ...S.dot, background: STATUS_COLOR[status] }} className={status === 'live' ? 'pulse' : ''} />
-          <span style={S.logo}>Δ TERMINAL</span>
-          <span style={S.sub}>{SYMBOL} · 5M · DELTA.EXCHANGE</span>
+          <span style={S.logo}>NiKEta Terminal</span>
+          <span style={S.sub}>{SYMBOL} · 5M</span>
         </div>
         {/* removed thin divider to declutter top-left */}
 
@@ -933,7 +915,7 @@ export default function Terminal() {
             <div style={{ flex:1 }} />
             <div style={{ display:'flex', gap:8, padding:'3px 0', alignItems:'center' }}>
                 <div style={{ display:'flex', gap:8, alignItems:'center' }}>
-                  <div style={{ color:'#94a3b8', fontSize:11 }}>Demo</div>
+                  <div style={{ color:'#94a3b8', fontSize:11 }}>Balance</div>
                   <div style={{ color:'#e2e8f0', fontWeight:700 }}>${demoBalance.toFixed(2)}</div>
                 </div>
                 <div style={{ width: 1, height: 18, background: 'rgba(255,255,255,0.03)' }} />
@@ -1050,7 +1032,7 @@ export default function Terminal() {
           </div>
 
           <div style={{ padding: '8px 10px' }}>
-            <div className="phdr">Demo P&L</div>
+            <div className="phdr">P&L</div>
             <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', padding:'8px 0' }}>
               <div>
                 <div style={{ color:'#94a3b8', fontSize:11 }}>Unrealized</div>
