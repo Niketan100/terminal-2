@@ -2,9 +2,16 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 
 const WS_URL    = 'wss://socket.india.delta.exchange';
 const REST_BASE = 'https://api.india.delta.exchange';
-const SYMBOL    = 'BTCUSD';
 
-export function useDeltaWS() {
+// List of available perpetual trading pairs on Delta Exchange
+const AVAILABLE_SYMBOLS = [
+  'BTCUSD', 'ETHUSD', 'LINKUSD', 'BNBUSD', 'XRPUSD', 'ADAUSD',
+  'DOGEUSD', 'LTCUSD', 'XLMUSD', 'BITUSD', 'ZECUSD', 'ATOMUSD',
+];
+
+export function useDeltaWS(initialSymbol = 'BTCUSD') {
+  const [symbol, setSymbol] = useState(initialSymbol);
+  const symbolRef = useRef(symbol);
   const [candles,     setCandles]     = useState([]);
   const [ticker,      setTicker]      = useState(null);
   const [trades,      setTrades]      = useState([]);
@@ -12,13 +19,18 @@ export function useDeltaWS() {
   const [fundingRate, setFundingRate] = useState(null);
   const [status,      setStatus]      = useState('disconnected');
   const [logs,        setLogs]        = useState([
-    { t: 'SYS', text: 'Δ Delta Terminal — BTCUSD Perpetual Futures', type: 'info' },
+    { t: 'SYS', text: 'NiKEta Terminal — Multi-Asset Trading', type: 'info' },
     { t: 'SYS', text: 'Type HELP for available commands', type: 'muted' },
   ]);
 
   const wsRef   = useRef(null);
   const pingRef = useRef(null);
   const resolutionRef = useRef('5m'); // Track resolution in a ref to avoid closure staleness in WS callback
+
+  // Update symbolRef whenever symbol changes
+  useEffect(() => {
+    symbolRef.current = symbol;
+  }, [symbol]);
 
   const log = useCallback((text, type = 'info') => {
     const t = new Date().toTimeString().slice(0, 8);
@@ -30,14 +42,14 @@ export function useDeltaWS() {
     const fetchHistory = useCallback(async (bars = 300, resolution = '5m') => {
     try {
       resolutionRef.current = resolution;
-      log(`Fetching OHLC history (${resolution})…`, 'info');
+      log(`Fetching OHLC history (${resolution}) for ${symbolRef.current}…`, 'info');
       const end   = Math.floor(Date.now() / 1000);
         // Map resolution to seconds (common cases)
         const resMap = { '1m': 60, '5m': 5 * 60, '15m': 15 * 60, '1h': 60 * 60 };
         const RES_SEC = resMap[resolution] || 5 * 60;
         const start = end - (bars * RES_SEC);
       // Use a resolution string that matches Delta's allowed values (e.g. '5m').
-      const url   = `${REST_BASE}/v2/history/candles?resolution=${encodeURIComponent(resolution)}&symbol=${SYMBOL}&start=${start}&end=${end}`;
+      const url   = `${REST_BASE}/v2/history/candles?resolution=${encodeURIComponent(resolution)}&symbol=${symbolRef.current}&start=${start}&end=${end}`;
       const res   = await fetch(url);
 
       if (!res.ok) {
@@ -108,18 +120,18 @@ export function useDeltaWS() {
         type: 'subscribe',
         payload: {
           channels: [
-            { name: 'v2/ticker',      symbols: [SYMBOL] },
-            { name: 'all_trades',     symbols: [SYMBOL] },
-            { name: 'l2_orderbook',   symbols: [SYMBOL] },
-            { name: 'candlestick_1m', symbols: [SYMBOL] },
-            { name: 'candlestick_5m', symbols: [SYMBOL] },
-            { name: 'funding_rate',   symbols: [SYMBOL] },
-            { name: 'mark_price',     symbols: [SYMBOL] },
+            { name: 'v2/ticker',      symbols: [symbolRef.current] },
+            { name: 'all_trades',     symbols: [symbolRef.current] },
+            { name: 'l2_orderbook',   symbols: [symbolRef.current] },
+            { name: 'candlestick_1m', symbols: [symbolRef.current] },
+            { name: 'candlestick_5m', symbols: [symbolRef.current] },
+            { name: 'funding_rate',   symbols: [symbolRef.current] },
+            { name: 'mark_price',     symbols: [symbolRef.current] },
           ],
         },
       }));
 
-      log('Subscribed to: ticker · trades · orderbook · candlestick_5m · funding', 'muted');
+      log(`Subscribed to: ticker · trades · orderbook · candlestick_5m · funding for ${symbolRef.current}`, 'muted');
 
       pingRef.current = setInterval(() => {
         if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'ping' }));
@@ -143,7 +155,7 @@ export function useDeltaWS() {
       switch (msg.type) {
 
         case 'v2/ticker':
-          if (msg.symbol === SYMBOL) {
+          if (msg.symbol === symbolRef.current) {
             setTicker(msg);
             // Also update last candle close price from ticker
             setCandles(prev => {
@@ -160,7 +172,7 @@ export function useDeltaWS() {
           break;
 
         case 'mark_price':
-          if (msg.symbol === SYMBOL) {
+          if (msg.symbol === symbolRef.current) {
             setTicker(prev => prev ? { ...prev, mark_price: msg.price ?? msg.mark_price } : { mark_price: msg.price ?? msg.mark_price });
           }
           break;
@@ -169,7 +181,7 @@ export function useDeltaWS() {
         case 'candlestick_5m':
         case 'candlestick_1m':
         case 'candlestick': {
-          if (msg.symbol !== SYMBOL) break;
+          if (msg.symbol !== symbolRef.current) break;
 
           // Check if this incoming candle matches our current chart resolution
           // 'candlestick_1m' vs '1m', 'candlestick_5m' vs '5m'
@@ -203,7 +215,7 @@ export function useDeltaWS() {
         }
 
         case 'all_trades': {
-          if (msg.symbol !== SYMBOL) break;
+          if (msg.symbol !== symbolRef.current) break;
           const fills = Array.isArray(msg.trades) ? msg.trades : [msg];
           const mapped = fills.map(f => ({
             price: parseFloat(f.price),
@@ -278,7 +290,7 @@ export function useDeltaWS() {
         }
 
         case 'l2_orderbook': {
-          if (msg.symbol !== SYMBOL) break;
+          if (msg.symbol !== symbolRef.current) break;
           const bids = (msg.buy  || []).slice(0, 25).map(b => [parseFloat(b.limit_price), parseFloat(b.size)]);
           const asks = (msg.sell || []).slice(0, 25).map(a => [parseFloat(a.limit_price), parseFloat(a.size)]);
           setOrderBook({ bids, asks });
@@ -286,7 +298,7 @@ export function useDeltaWS() {
         }
 
         case 'funding_rate':
-          if (msg.symbol === SYMBOL) setFundingRate(parseFloat(msg.funding_rate));
+          if (msg.symbol === symbolRef.current) setFundingRate(parseFloat(msg.funding_rate));
           break;
 
         case 'pong':
@@ -313,11 +325,210 @@ export function useDeltaWS() {
     log('Disconnected', 'warn');
   }, [log]);
 
+  // Handle symbol changes: reconnect with new symbol
+  useEffect(() => {
+    if (status === 'live' && symbolRef.current !== symbol) {
+      log(`Switching to ${symbol}...`, 'info');
+      
+      // Close old connection
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+        wsRef.current.close();
+      }
+      
+      // Clear old data immediately
+      setCandles([]);
+      setTicker(null);
+      setTrades([]);
+      setOrderBook({ bids: [], asks: [] });
+      setFundingRate(null);
+      
+      // Update ref
+      symbolRef.current = symbol;
+      
+      // Reconnect to new symbol
+      setTimeout(() => {
+        if (wsRef.current?.readyState < 2) wsRef.current?.close();
+        clearInterval(pingRef.current);
+        setStatus('connecting');
+        log(`Connecting to ${symbol}…`, 'info');
+
+        const ws = new WebSocket(WS_URL);
+        wsRef.current = ws;
+
+        ws.onopen = () => {
+          setStatus('live');
+          log(`✓ Connected to ${symbol}`, 'success');
+
+          // Subscribe to new symbol channels
+          ws.send(JSON.stringify({
+            type: 'subscribe',
+            payload: {
+              channels: [
+                { name: 'v2/ticker',      symbols: [symbol] },
+                { name: 'all_trades',     symbols: [symbol] },
+                { name: 'l2_orderbook',   symbols: [symbol] },
+                { name: 'candlestick_1m', symbols: [symbol] },
+                { name: 'candlestick_5m', symbols: [symbol] },
+                { name: 'funding_rate',   symbols: [symbol] },
+                { name: 'mark_price',     symbols: [symbol] },
+              ],
+            },
+          }));
+
+          log(`Subscribed to ${symbol} channels`, 'muted');
+
+          pingRef.current = setInterval(() => {
+            if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'ping' }));
+          }, 25_000);
+        };
+
+        ws.onerror = () => { setStatus('error'); log('WebSocket error', 'danger'); };
+        ws.onclose = ev => {
+          setStatus('disconnected');
+          clearInterval(pingRef.current);
+          log(`WebSocket closed (code ${ev.code})`, 'warn');
+        };
+
+        ws.onmessage = ev => {
+          let msg;
+          try { msg = JSON.parse(ev.data); } catch { return; }
+          if (!msg?.type) return;
+
+          switch (msg.type) {
+            case 'v2/ticker':
+              if (msg.symbol === symbol) {
+                setTicker(msg);
+                setCandles(prev => {
+                  if (!prev.length) return prev;
+                  const p = parseFloat(msg.mark_price || msg.close || msg.last_price || 0);
+                  if (!p) return prev;
+                  const last = { ...prev[prev.length - 1] };
+                  last.c = p;
+                  if (p > last.h) last.h = p;
+                  if (p < last.l) last.l = p;
+                  return [...prev.slice(0, -1), last];
+                });
+              }
+              break;
+
+            case 'mark_price':
+              if (msg.symbol === symbol) {
+                setTicker(prev => prev ? { ...prev, mark_price: msg.price ?? msg.mark_price } : { mark_price: msg.price ?? msg.mark_price });
+              }
+              break;
+
+            case 'candlestick_5m':
+            case 'candlestick_1m':
+            case 'candlestick': {
+              if (msg.symbol !== symbol) break;
+              const incRes = msg.type.includes('1m') ? '1m' : '5m';
+              if (incRes !== resolutionRef.current) break;
+              const time = msg.time ?? msg.start_time ?? msg.timestamp;
+              const nc = {
+                t:  new Date(time * 1000).toISOString().slice(0, 19),
+                o:  parseFloat(msg.open   ?? msg.o),
+                h:  parseFloat(msg.high   ?? msg.h),
+                l:  parseFloat(msg.low    ?? msg.l),
+                c:  parseFloat(msg.close  ?? msg.c),
+                v:  parseFloat(msg.volume ?? msg.v ?? 0),
+                bv: null, sv: null, live: true,
+              };
+              if (!nc.o || !nc.c) break;
+              setCandles(prev => {
+                if (!prev.length) return [nc];
+                const last = prev[prev.length - 1];
+                if (last.t === nc.t) return [...prev.slice(0, -1), nc];
+                if (new Date(nc.t) < new Date(last.t)) return prev;
+                return [...prev.slice(-499), nc];
+              });
+              break;
+            }
+
+            case 'all_trades': {
+              if (msg.symbol !== symbol) break;
+              const fills = Array.isArray(msg.trades) ? msg.trades : [msg];
+              const mapped = fills.map(f => ({
+                price: parseFloat(f.price),
+                size:  parseFloat(f.size),
+                side:  f.buyer_role === 'taker' || f.side === 'buy' ? 'buy' : 'sell',
+                ts:    new Date().toTimeString().slice(0, 8),
+                tms:   Date.now(),
+              })).filter(f => f.price > 0);
+              if (!mapped.length) break;
+              setTrades(prev => [...mapped, ...prev].slice(0, 80));
+              setCandles(prev => {
+                if (!prev.length) return prev;
+                let last = { ...prev[prev.length - 1] };
+                const lastTime = new Date(last.t.endsWith('Z') ? last.t : last.t + 'Z').getTime();
+                const nowTime = Date.now();
+                const currentRes = resolutionRef.current;
+                const resMs = currentRes === '1m' ? 60000 : 300000;
+                const nextCandleTime = lastTime + resMs;
+                if (nowTime >= nextCandleTime) {
+                   const newTimeStr = new Date(nextCandleTime).toISOString().slice(0, 19);
+                   const newCandle = {
+                     t: newTimeStr,
+                     o: last.c,
+                     h: last.c,
+                     l: last.c,
+                     c: last.c,
+                     v: 0,
+                     bv: 0,
+                     sv: 0,
+                     live: true
+                   };
+                   mapped.forEach(f => {
+                     newCandle.c = f.price;
+                     if (f.price > newCandle.h) newCandle.h = f.price;
+                     if (f.price < newCandle.l) newCandle.l = f.price;
+                     newCandle.v  += f.size;
+                     newCandle.bv += (f.side === 'buy'  ? f.size : 0);
+                     newCandle.sv += (f.side === 'sell' ? f.size : 0);
+                   });
+                   return [...prev.slice(-499), newCandle];
+                }
+                mapped.forEach(f => {
+                  last.c = f.price;
+                  if (f.price > last.h) last.h = f.price;
+                  if (f.price < last.l) last.l = f.price;
+                  last.v  = (last.v  || 0) + f.size;
+                  last.bv = (last.bv || 0) + (f.side === 'buy'  ? f.size : 0);
+                  last.sv = (last.sv || 0) + (f.side === 'sell' ? f.size : 0);
+                });
+                return [...prev.slice(0, -1), last];
+              });
+              break;
+            }
+
+            case 'l2_orderbook': {
+              if (msg.symbol !== symbol) break;
+              const bids = (msg.buy  || []).slice(0, 25).map(b => [parseFloat(b.limit_price), parseFloat(b.size)]);
+              const asks = (msg.sell || []).slice(0, 25).map(a => [parseFloat(a.limit_price), parseFloat(a.size)]);
+              setOrderBook({ bids, asks });
+              break;
+            }
+
+            case 'funding_rate':
+              if (msg.symbol === symbol) setFundingRate(parseFloat(msg.funding_rate));
+              break;
+
+            case 'pong':
+            case 'subscriptions':
+              break;
+
+            default:
+              break;
+          }
+        };
+      }, 100);
+    }
+  }, [symbol, status, log]);
+
   useEffect(() => {
     fetchHistory().then(connect);
     return () => { clearInterval(pingRef.current); wsRef.current?.close(); };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  return { candles, ticker, trades, orderBook, fundingRate, status, logs, log, connect, disconnect, fetchHistory };
+  return { candles, ticker, trades, orderBook, fundingRate, status, logs, log, connect, disconnect, fetchHistory, symbol, setSymbol, availableSymbols: AVAILABLE_SYMBOLS };
 }

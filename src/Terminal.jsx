@@ -23,6 +23,7 @@ function Live5mPanel({ trades = [], bids = [], asks = [], now }) {
     </div>
   );
 }
+import { BotPanel } from './TradingBot.jsx';
 import { rsi, macd, bb, findSR, analyzeSetup, vwap } from './indicators.js';
 
 const STATUS_COLOR = {
@@ -50,6 +51,7 @@ export default function Terminal() {
     candles, ticker, trades, orderBook, fundingRate,
     status, logs, log,
     connect, disconnect, fetchHistory,
+    symbol, setSymbol, availableSymbols
   } = useDeltaWS();
 
   // Theme: hacker (neon) or default. Persisted in localStorage as 'dt.theme'
@@ -87,6 +89,7 @@ export default function Terminal() {
 
   // layout
   const bodyRef = useRef(null);
+  const botRef = useRef(null);
   const [leftWidth, setLeftWidth] = useState(240);
   const [rightWidth, setRightWidth] = useState(300);
   // Reserve most space to main chart and a single smaller volume pane
@@ -750,9 +753,27 @@ export default function Terminal() {
         <div style={S.brand}>
           <div style={{ ...S.dot, background: STATUS_COLOR[status] }} className={status === 'live' ? 'pulse' : ''} />
           <span style={S.logo}>NiKEta Terminal</span>
-          <span style={S.sub}>{SYMBOL} · 5M</span>
+          <span style={S.sub}>{symbol} · 5M</span>
         </div>
         {/* removed thin divider to declutter top-left */}
+
+        {/* Symbol Switcher */}
+        <div style={{ display: 'flex', gap: 4, alignItems: 'center', marginLeft: 12 }}>
+          {availableSymbols.slice(0, 6).map(s => (
+            <button
+              key={s}
+              className={`btn ${symbol === s ? 'btn-on' : ''}`}
+              onClick={() => {
+                setSymbol(s);
+                fetchHistory(300, '5m');
+                log(`Switched to ${s}`, 'success');
+              }}
+              style={{ fontSize: 10, padding: '4px 8px' }}
+            >
+              {s.replace('USD', '')}
+            </button>
+          ))}
+        </div>
 
         {markPrice > 0 && (
           <div style={{ display: 'flex', alignItems: 'baseline', gap: 8 }}>
@@ -1158,10 +1179,21 @@ export default function Terminal() {
             ))}
           </div>
         </div>
+        
       )}
 
       </div>
+      <BotPanel
+  candles={candles}
+  ref={botRef}
+  markPrice={markPrice}
+  openPosition={openPosition}
+  closePosition={closePosition}
+  positions={positions}
+  log={log}
+/>
     </div>
+    
   );
 }
 
