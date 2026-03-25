@@ -1,6 +1,5 @@
-// TradingBot.jsx — Institutional Level Bot with Dynamic Role Reversal
-// Levels are NOT permanently support or resistance.
-// Their role is determined purely by where current price sits relative to them.
+// TradingBot.jsx — v5 · Institutional Engine
+// Levels + Quant Models + Liquidity Sweep + Dynamic TP + Adaptive Trailing SL
 
 import {
   useEffect, useRef, useState, useCallback, useMemo,
@@ -8,7 +7,7 @@ import {
 } from 'react';
 
 // ═══════════════════════════════════════════════════════════════════
-//  MATH
+//  MATH CORE
 // ═══════════════════════════════════════════════════════════════════
 
 function calcEMA(prices, period) {
@@ -18,7 +17,6 @@ function calcEMA(prices, period) {
   for (let i = period; i < prices.length; i++) e = prices[i] * k + e * (1 - k);
   return e;
 }
-
 function calcRSI(prices, period = 14) {
   if (!prices || prices.length < period + 1) return 50;
   let g = 0, l = 0;
@@ -28,7 +26,6 @@ function calcRSI(prices, period = 14) {
   }
   return 100 - 100 / (1 + (g / period) / ((l / period) || 0.001));
 }
-
 function calcATR(candles, period = 14) {
   if (!candles || candles.length < period + 1) return null;
   const trs = [];
@@ -39,425 +36,576 @@ function calcATR(candles, period = 14) {
   return trs.slice(-period).reduce((a, b) => a + b, 0) / period;
 }
 
-function calcBBWidth(closes, period = 20) {
-  if (!closes || closes.length < period) return null;
-  const sl = closes.slice(-period);
-  const mean = sl.reduce((a, b) => a + b, 0) / period;
-  const std = Math.sqrt(sl.reduce((a, b) => a + (b - mean) ** 2, 0) / period);
-  return (4 * std) / (mean || 1);
+// ── KALMAN FILTER ─────────────────────────────────────────────────
+function kalmanFilter(prices) {
+  if (!prices || prices.length < 5) return null;
+  let x = prices[0], v = 0, p = 1, pv = 0;
+  const Q = 0.01, R = 0.1;
+  for (let i = 1; i < prices.length; i++) {
+    const xP = x + v, pP = p + pv + Q;
+    const K = pP / (pP + R), inn = prices[i] - xP;
+    x = xP + K * inn; v = v + 0.1 * inn; p = (1 - K) * pP; pv = pv + Q * 0.01;
+  }
+  const vPct = (v / (x || 1)) * 100;
+  return { price: x, velocity: v, velocityPct: vPct,
+    trend: vPct > 0.015 ? 'UP' : vPct < -0.015 ? 'DOWN' : 'FLAT',
+    strength: Math.min(1, Math.abs(vPct) / 0.05) };
 }
 
-// ── Swing pivots ──────────────────────────────────────────────────
+// ── GARCH(1,1) ────────────────────────────────────────────────────
+function garch(prices) {
+  if (!prices || prices.length < 20) return null;
+  const ret = [];
+  for (let i = 1; i < prices.length; i++) ret.push(Math.log(prices[i] / prices[i - 1]));
+  const mean = ret.reduce((a, b) => a + b, 0) / ret.length;
+  let s2 = ret.reduce((s, r) => s + (r - mean) ** 2, 0) / ret.length;
+  const hist = [s2];
+  for (let i = 1; i < ret.length; i++) { s2 = 0.000002 + 0.1 * ret[i-1]**2 + 0.85 * s2; hist.push(s2); }
+  const cv = Math.sqrt(s2) * Math.sqrt(288) * 100;
+  const pv = Math.sqrt(hist[hist.length - 5] || s2) * Math.sqrt(288) * 100;
+  const chg = ((cv - pv) / (pv || 1)) * 100;
+  return { currentVol: +cv.toFixed(3), volChangePct: +chg.toFixed(2),
+    regime: chg > 8 ? 'EXPANDING' : chg < -8 ? 'CONTRACTING' : 'STABLE',
+    mult: chg > 8 ? 1.35 : chg < -8 ? 0.7 : 1.0 };
+}
+
+// ── HURST EXPONENT ────────────────────────────────────────────────
+function hurstExponent(prices) {
+  if (!prices || prices.length < 30) return null;
+  const ret = [];
+  for (let i = 1; i < prices.length; i++) ret.push(Math.log(prices[i] / prices[i - 1]));
+  const n = ret.length;
+  const lags = [4, 8, 16, Math.floor(n / 2)].filter(l => l < n);
+  const rsVals = [];
+  for (const lag of lags) {
+    const chunks = Math.floor(n / lag); let rsSum = 0;
+    for (let c = 0; c < chunks; c++) {
+      const sub = ret.slice(c * lag, (c + 1) * lag);
+      const m = sub.reduce((a, b) => a + b, 0) / sub.length;
+      let cum = 0;
+      const cd = sub.map(d => { cum += (d - m); return cum; });
+      const R = Math.max(...cd) - Math.min(...cd);
+      const S = Math.sqrt(sub.reduce((s, r) => s + (r - m) ** 2, 0) / sub.length);
+      if (S > 0) rsSum += R / S;
+    }
+    rsVals.push({ lag, rs: rsSum / chunks });
+  }
+  const lx = rsVals.map(r => Math.log(r.lag)), ly = rsVals.map(r => Math.log(r.rs));
+  const mx = lx.reduce((a, b) => a + b, 0) / lx.length, my = ly.reduce((a, b) => a + b, 0) / ly.length;
+  const num = lx.reduce((s, x, i) => s + (x - mx) * (ly[i] - my), 0);
+  const den = lx.reduce((s, x) => s + (x - mx) ** 2, 0);
+  const H = Math.min(0.95, Math.max(0.05, den > 0 ? num / den : 0.5));
+  return { H: +H.toFixed(3),
+    regime: H > 0.55 ? 'TRENDING' : H < 0.45 ? 'MEAN_REV' : 'RANDOM',
+    conf:   H > 0.65 || H < 0.35 ? 'HIGH' : H > 0.58 || H < 0.42 ? 'MED' : 'LOW' };
+}
+
+// ── VOLUME PROFILE ────────────────────────────────────────────────
+function volumeProfile(candles, buckets = 30) {
+  if (!candles || candles.length < 10) return null;
+  const minP = Math.min(...candles.map(c => c.l));
+  const maxP = Math.max(...candles.map(c => c.h));
+  const step = (maxP - minP) / buckets || 1;
+  const prof = Array.from({ length: buckets }, (_, i) => ({
+    price: minP + (i + 0.5) * step, lo: minP + i * step, hi: minP + (i + 1) * step, vol: 0
+  }));
+  for (const c of candles) {
+    const vol = c.v || 1;
+    for (const b of prof) {
+      const ov = Math.min(c.h, b.hi) - Math.max(c.l, b.lo);
+      if (ov > 0) b.vol += vol * (ov / ((c.h - c.l) || step));
+    }
+  }
+  const tot = prof.reduce((s, b) => s + b.vol, 0);
+  const poc = prof.reduce((a, b) => b.vol > a.vol ? b : a);
+  let acc = poc.vol, lo = prof.indexOf(poc), hi = lo;
+  while (acc < tot * 0.7 && (lo > 0 || hi < prof.length - 1)) {
+    const aL = lo > 0 ? prof[lo-1].vol : 0, aH = hi < prof.length-1 ? prof[hi+1].vol : 0;
+    if (aH >= aL) { hi++; acc += aH; } else { lo--; acc += aL; }
+  }
+  return { poc: +poc.price.toFixed(1), vah: +prof[hi].hi.toFixed(1), val: +prof[lo].lo.toFixed(1),
+    keyLevels: [
+      { price: +prof[hi].hi.toFixed(1), label: 'VAH', strength: 4 },
+      { price: +poc.price.toFixed(1),   label: 'POC', strength: 5 },
+      { price: +prof[lo].lo.toFixed(1), label: 'VAL', strength: 4 },
+    ]};
+}
+
+// ── MICROSTRUCTURE ────────────────────────────────────────────────
+function microstructure(trades = [], orderBook = {}, windowMs = 120000) {
+  const now = Date.now();
+  const rec = trades.filter(t => t.tms && t.tms >= now - windowMs);
+  let bv = 0, sv = 0;
+  for (const t of rec) { const s = parseFloat(t.size||0); if (t.side==='buy') bv+=s; else sv+=s; }
+  const delta = bv - sv, tot = bv + sv || 1, dr = delta / tot;
+  const bids = (orderBook.bids||[]).slice(0,10), asks = (orderBook.asks||[]).slice(0,10);
+  const bw = bids.reduce((s,b)=>s+(b[1]||0),0), aw = asks.reduce((s,a)=>s+(a[1]||0),0);
+  const obi = (bw - aw) / ((bw + aw) || 1);
+  const score = dr * 0.6 + obi * 0.4;
+  const pm = rec.length > 1 ? Math.abs(rec[0].price - rec[rec.length-1].price) / (rec[rec.length-1].price||1) : 0;
+  return { delta: +delta.toFixed(4), deltaRatio: +dr.toFixed(3), obImbalance: +obi.toFixed(3),
+    score: +score.toFixed(3), absorbed: tot > 0.5 && pm < 0.001,
+    bias: score > 0.15 ? 'BUY' : score < -0.15 ? 'SELL' : 'NEUTRAL',
+    recentTrades: rec.length };
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  LEVEL ENGINE
+// ═══════════════════════════════════════════════════════════════════
+
 function findSwingPoints(candles, lookback = 5) {
-  const points = [];
+  const pts = [];
   for (let i = lookback; i < candles.length - lookback; i++) {
-    const c = candles[i];
-    let isH = true, isL = true;
+    const c = candles[i]; let isH = true, isL = true;
     for (let j = i - lookback; j <= i + lookback; j++) {
       if (j === i) continue;
       if (candles[j].h >= c.h) isH = false;
       if (candles[j].l <= c.l) isL = false;
     }
-    // Store both highs and lows as NEUTRAL price points — no label yet
-    if (isH) points.push({ price: c.h, idx: i, origin: 'high' });
-    if (isL) points.push({ price: c.l, idx: i, origin: 'low' });
+    if (isH) pts.push({ price: c.h, idx: i, origin: 'high' });
+    if (isL) pts.push({ price: c.l, idx: i, origin: 'low' });
   }
-  return points;
+  return pts;
 }
 
-// Cluster nearby points into zones regardless of high/low origin
 function clusterLevels(points, pct = 0.0025) {
-  const zones = [];
-  const used = new Set();
+  const zones = [], used = new Set();
   const sorted = [...points].sort((a, b) => a.price - b.price);
   for (let i = 0; i < sorted.length; i++) {
     if (used.has(i)) continue;
-    const cluster = [sorted[i].price];
-    const idxs = [sorted[i].idx];
+    const cluster = [sorted[i].price], idxs = [sorted[i].idx ?? i];
     for (let j = i + 1; j < sorted.length; j++) {
       if (used.has(j)) continue;
       if (Math.abs(sorted[j].price - sorted[i].price) / sorted[i].price < pct) {
-        cluster.push(sorted[j].price);
-        idxs.push(sorted[j].idx);
-        used.add(j);
+        cluster.push(sorted[j].price); idxs.push(sorted[j].idx ?? j); used.add(j);
       }
     }
     used.add(i);
-    const avgPrice  = cluster.reduce((a, b) => a + b, 0) / cluster.length;
-    const lastTouch = Math.max(...idxs);
-    zones.push({
-      price:     avgPrice,
-      strength:  cluster.length,  // more touches = stronger level
-      lastTouch,
-      // role is NOT set here — it is determined dynamically from price
-    });
+    zones.push({ price: cluster.reduce((a,b)=>a+b,0)/cluster.length,
+      strength: cluster.length, lastTouch: Math.max(...idxs), source: 'swing' });
   }
   return zones.sort((a, b) => b.strength - a.strength);
 }
 
-// ── THE KEY FUNCTION ──────────────────────────────────────────────
-// Classify all levels dynamically based on current price.
-// Above price = support. Below price... wait — flip it:
-//   price ABOVE zone → zone acts as SUPPORT (floor)
-//   price BELOW zone → zone acts as RESISTANCE (ceiling)
-// Also detects role reversal: was this zone recently on the other side?
-function classifyLevels(zones, currentPrice, atr) {
-  const buffer = atr ? atr * 0.2 : currentPrice * 0.001;
-  const supports = [];
-  const resistances = [];
-
-  for (const z of zones) {
-    if (currentPrice > z.price + buffer) {
-      // Price is above this level → it's acting as SUPPORT
-      supports.push({ ...z, role: 'support', distPct: (currentPrice - z.price) / currentPrice * 100 });
-    } else if (currentPrice < z.price - buffer) {
-      // Price is below this level → it's acting as RESISTANCE
-      resistances.push({ ...z, role: 'resistance', distPct: (z.price - currentPrice) / currentPrice * 100 });
+function buildAllLevels(candles, vpData) {
+  if (!candles || candles.length < 20) return [];
+  const swingPts = findSwingPoints(candles.slice(-200), 4);
+  const zones    = clusterLevels(swingPts);
+  if (vpData) {
+    for (const vp of vpData.keyLevels) {
+      const near = zones.find(z => Math.abs(z.price - vp.price) / vp.price < 0.002);
+      if (near) { near.strength += vp.strength; near.source = `${near.source}+${vp.label}`; }
+      else zones.push({ price: vp.price, strength: vp.strength, source: vp.label, lastTouch: 0 });
     }
-    // Levels within the buffer are "at price" — handled as near-level alerts
   }
-
-  // Sort: supports descending (nearest first), resistances ascending (nearest first)
-  supports.sort((a, b) => b.price - a.price);
-  resistances.sort((a, b) => a.price - b.price);
-
-  return { supports, resistances };
+  return zones.sort((a, b) => b.strength - a.strength);
 }
 
-// Levels the price is currently testing (within touch zone)
-function getLevelsAtPrice(zones, currentPrice, atr) {
-  const touchZone = atr ? atr * 0.5 : currentPrice * 0.002;
-  return zones.filter(z => Math.abs(z.price - currentPrice) <= touchZone);
+function classifyLevels(zones, price, atr) {
+  const buf = atr ? atr * 0.2 : price * 0.001;
+  return {
+    supports:    zones.filter(z => price > z.price + buf).sort((a,b) => b.price - a.price),
+    resistances: zones.filter(z => price < z.price - buf).sort((a,b) => a.price - b.price),
+    atLevel:     zones.filter(z => Math.abs(z.price - price) <= (atr ? atr * 0.6 : price * 0.002)),
+  };
 }
 
-// ── Trend ─────────────────────────────────────────────────────────
-function getTrend(candles, markPrice) {
-  const closes = candles.map(c => c.c);
-  const ema21  = calcEMA(closes, 21);
-  const ema50  = calcEMA(closes, 50);
-  const ema200 = calcEMA(closes, 200);
-  if (!ema21 || !ema50) return { dir: 'NEUTRAL', ema21, ema50, ema200, strength: 0 };
-  let score = 0;
-  if (markPrice > ema21)  score++;
-  if (markPrice > ema50)  score++;
-  if (ema21 > ema50)      score++;
-  if (!ema200 || markPrice > ema200) score++;
-  const dir = score >= 3 ? 'UP' : score <= 1 ? 'DOWN' : 'NEUTRAL';
-  return { dir, ema21, ema50, ema200, strength: score };
-}
+// ═══════════════════════════════════════════════════════════════════
+//  LIQUIDITY SWEEP DETECTOR
+//  A sweep = price breaks above a swing high (or below a swing low)
+//  then closes back inside. This triggers stop hunts.
+//  We wait for the REVERSAL candle after the sweep → enter opposite direction.
+// ═══════════════════════════════════════════════════════════════════
 
-// ── Candle pattern ────────────────────────────────────────────────
-function detectPattern(candles) {
-  if (!candles || candles.length < 3) return null;
-  const c = candles[candles.length - 1];
-  const prev = candles[candles.length - 2];
-  const range     = (c.h - c.l) || 0.001;
-  const body      = Math.abs(c.c - c.o);
-  const upperWick = c.h - Math.max(c.c, c.o);
-  const lowerWick = Math.min(c.c, c.o) - c.l;
+function detectLiquiditySweep(candles, zones, atr) {
+  if (!candles || candles.length < 6 || !atr) return null;
+  const last  = candles[candles.length - 1];
+  const prev  = candles[candles.length - 2];
+  const prev2 = candles[candles.length - 3];
+  const sweepBuffer = atr * 0.3;
 
-  if (upperWick / range > 0.55 && body / range < 0.35 && c.c < prev.c)
-    return { type: 'BEARISH_PIN', label: 'Bearish pin', dir: 'bear', conf: Math.round(upperWick / range * 100) };
-  if (lowerWick / range > 0.55 && body / range < 0.35 && c.c > prev.c)
-    return { type: 'BULLISH_PIN', label: 'Bullish pin', dir: 'bull', conf: Math.round(lowerWick / range * 100) };
-  if (prev.c > prev.o && c.c < c.o && c.o >= prev.c && c.c <= prev.o)
-    return { type: 'BEARISH_ENG', label: 'Bearish engulf', dir: 'bear', conf: 80 };
-  if (prev.c < prev.o && c.c > c.o && c.o <= prev.c && c.c >= prev.o)
-    return { type: 'BULLISH_ENG', label: 'Bullish engulf', dir: 'bull', conf: 80 };
-
-  const last3    = candles.slice(-3);
-  const avgBody  = last3.reduce((s, x) => s + Math.abs(x.c - x.o), 0) / 3;
-  const avgRange = last3.reduce((s, x) => s + (x.h - x.l), 0) / 3;
-  const prevAvgRange = candles.length > 8
-    ? candles.slice(-8, -3).reduce((s, x) => s + (x.h - x.l), 0) / 5
-    : avgRange * 2;
-  if (avgBody / (avgRange || 1) < 0.35 && avgRange < prevAvgRange * 0.55)
-    return { type: 'COMPRESSION', label: 'Compression', dir: 'neutral', conf: 65 };
-
+  // Bearish liquidity sweep (bull trap):
+  // Candle pierced ABOVE a resistance level, then closed BACK BELOW it
+  // → price swept the highs (triggered buy stops), now reversing down
+  for (const z of zones) {
+    // Sweep high: prior candle broke above level, current closed back below
+    if (prev.h > z.price + sweepBuffer && prev.c < z.price &&
+        last.c < z.price && last.c < last.o) {
+      // Confirmation: bearish close after sweep
+      const bodyPct = Math.abs(last.c - last.o) / ((last.h - last.l) || 1);
+      if (bodyPct > 0.3) {
+        return {
+          type:       'BEAR_SWEEP',
+          direction:  'SELL',
+          sweptLevel: z,
+          sweepHigh:  prev.h,
+          entryNote:  `Swept high $${z.price.toFixed(0)} (str×${z.strength}) → bearish reversal`,
+          confidence: Math.min(95, 60 + z.strength * 8 + Math.round(bodyPct * 30)),
+        };
+      }
+    }
+    // Sweep low: prior candle broke below level, current closed back above → bullish
+    if (prev.l < z.price - sweepBuffer && prev.c > z.price &&
+        last.c > z.price && last.c > last.o) {
+      const bodyPct = Math.abs(last.c - last.o) / ((last.h - last.l) || 1);
+      if (bodyPct > 0.3) {
+        return {
+          type:       'BULL_SWEEP',
+          direction:  'BUY',
+          sweptLevel: z,
+          sweepLow:   prev.l,
+          entryNote:  `Swept low $${z.price.toFixed(0)} (str×${z.strength}) → bullish reversal`,
+          confidence: Math.min(95, 60 + z.strength * 8 + Math.round(bodyPct * 30)),
+        };
+      }
+    }
+  }
   return null;
 }
 
-// ── Level-based TP/SL ─────────────────────────────────────────────
-// Uses the dynamically classified levels — not ATR
-function getLevelTargets({ markPrice, side, supports, resistances, atr, minRR = 1.5 }) {
-  let tp = null, sl = null, tpLevel = null, slLevel = null;
+// ═══════════════════════════════════════════════════════════════════
+//  DYNAMIC TP ENGINE
+//  Scans between current price and original TP.
+//  If a significant level exists in between → move TP there.
+//  Prevents giving back profits by running into hidden resistance.
+// ═══════════════════════════════════════════════════════════════════
+
+function getDynamicTP({ markPrice, side, originalTP, supports, resistances, allZones, atr }) {
+  if (!originalTP) return { tp: null, adjusted: false, reason: 'No original TP' };
+  const minMove = atr ? atr * 0.5 : Math.abs(originalTP - markPrice) * 0.1;
 
   if (side === 'buy') {
-    // TP = nearest resistance above (where price will travel to)
-    tpLevel = resistances[0] || null;
-    tp      = tpLevel?.price || null;
-    // SL = just below nearest support below (level that invalidates)
-    slLevel = supports[0] || null;
-    const slBase = slLevel ? slLevel.price : markPrice - (atr || markPrice * 0.005) * 2;
-    sl = slBase - (atr ? atr * 0.25 : markPrice * 0.001);
+    // Find any resistance between current price+minMove and originalTP
+    const inRange = resistances.filter(z =>
+      z.price > markPrice + minMove && z.price < originalTP - atr * 0.2
+    ).sort((a, b) => b.strength - a.strength);
+    // Take the strongest one (not the closest — avoid being too conservative)
+    const strongest = inRange.find(z => z.strength >= 2);
+    if (strongest) return { tp: strongest.price, adjusted: true,
+      reason: `Resistance $${strongest.price.toFixed(0)} (str×${strongest.strength}) inside target — TP moved` };
   } else {
-    // TP = nearest support below
-    tpLevel = supports[0] || null;
-    tp      = tpLevel?.price || null;
-    // SL = just above nearest resistance above
-    slLevel = resistances[0] || null;
-    const slBase = slLevel ? slLevel.price : markPrice + (atr || markPrice * 0.005) * 2;
-    sl = slBase + (atr ? atr * 0.25 : markPrice * 0.001);
+    const inRange = supports.filter(z =>
+      z.price < markPrice - minMove && z.price > originalTP + atr * 0.2
+    ).sort((a, b) => b.strength - a.strength);
+    const strongest = inRange.find(z => z.strength >= 2);
+    if (strongest) return { tp: strongest.price, adjusted: true,
+      reason: `Support $${strongest.price.toFixed(0)} (str×${strongest.strength}) inside target — TP moved` };
   }
-
-  if (!tp || !sl) return { tp, sl, rr: null, tpLevel, slLevel, valid: false };
-
-  const reward = side === 'buy' ? tp - markPrice : markPrice - tp;
-  const risk   = side === 'buy' ? markPrice - sl : sl - markPrice;
-  const rr     = risk > 0 ? +(reward / risk).toFixed(2) : null;
-  const valid  = rr !== null && rr >= minRR;
-
-  return { tp, sl, rr, tpLevel, slLevel, valid };
+  return { tp: originalTP, adjusted: false, reason: 'TP unchanged — no strong level in path' };
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  STRATEGIES
+//  ADAPTIVE TRAILING SL
+//  Moves SL in trade's favor only (ratchet).
+//  Uses ATR×2.2 so normal volatility doesn't stop it out.
+//  Also checks: if price approaches a strong level, tighten to ATR×1.3.
 // ═══════════════════════════════════════════════════════════════════
 
-const STRATEGIES = {
+function getTrailingSL({ markPrice, side, currentSL, entryPrice, atr, supports, resistances }) {
+  if (!atr) return currentSL;
+  const normalTrail = atr * 2.2;   // breathing room
+  const tightTrail  = atr * 1.3;   // near a level
 
-  LEVEL_BOUNCE: {
-    name: 'Level Bounce', tag: 'LB',
-    desc: 'Bounce from a level when trend agrees. TP/SL = next levels above/below.',
-    minRR: 1.5,
-    evaluate({ candles, markPrice, supports, resistances, atLevel, atr, trend, pattern, rsiVal }) {
-      // LONG: Price at a level that's currently acting as support + bullish confirmation + uptrend
-      if (trend.dir === 'UP' || trend.dir === 'NEUTRAL') {
-        for (const z of atLevel) {
-          // This level is currently being tested as support (price came from above)
-          const isSupport = z.price < markPrice || Math.abs(z.price - markPrice) / markPrice < 0.002;
-          if (!isSupport) continue;
-          const bull = pattern?.dir === 'bull';
-          const rsiOk = rsiVal < 60;
-          if (!bull) continue;
-          const score = z.strength * 20 + pattern.conf * 0.4 + (rsiOk ? 18 : 0) + trend.strength * 8;
-          const targets = getLevelTargets({ markPrice, side: 'buy', supports, resistances, atr, minRR: this.minRR });
-          if (!targets.valid) return { signal: 'HOLD', score: 0, reason: `Bounce at $${z.price.toFixed(0)} · R:R ${targets.rr ?? '—'} < ${this.minRR}` };
-          return { signal: 'BUY', score: Math.round(score), ...targets,
-            reason: `Support bounce @ $${z.price.toFixed(0)} (str×${z.strength}) · ${pattern.label} · RSI ${rsiVal.toFixed(1)}` };
-        }
-      }
+  // Check if price is near a key level (tighten trail)
+  const nearLevel = side === 'buy'
+    ? resistances.some(z => z.strength >= 2 && z.price < markPrice + atr * 1.5 && z.price > markPrice)
+    : supports.some(z => z.strength >= 2 && z.price > markPrice - atr * 1.5 && z.price < markPrice);
 
-      // SHORT: Price at a level acting as resistance + bearish confirmation + downtrend
-      if (trend.dir === 'DOWN' || trend.dir === 'NEUTRAL') {
-        for (const z of atLevel) {
-          const isResist = z.price > markPrice || Math.abs(z.price - markPrice) / markPrice < 0.002;
-          if (!isResist) continue;
-          const bear = pattern?.dir === 'bear';
-          const rsiOk = rsiVal > 45;
-          if (!bear) continue;
-          const score = z.strength * 20 + pattern.conf * 0.4 + (rsiOk ? 18 : 0) + trend.strength * 8;
-          const targets = getLevelTargets({ markPrice, side: 'sell', supports, resistances, atr, minRR: this.minRR });
-          if (!targets.valid) return { signal: 'HOLD', score: 0, reason: `Rejection at $${z.price.toFixed(0)} · R:R ${targets.rr ?? '—'} < ${this.minRR}` };
-          return { signal: 'SELL', score: Math.round(score), ...targets,
-            reason: `Resistance rejection @ $${z.price.toFixed(0)} (str×${z.strength}) · ${pattern.label} · RSI ${rsiVal.toFixed(1)}` };
-        }
-      }
+  const trail    = nearLevel ? tightTrail : normalTrail;
+  const newSL    = side === 'buy' ? markPrice - trail : markPrice + trail;
 
-      return { signal: 'HOLD', score: 0, reason: `Not at a key level · Nearest sup $${supports[0]?.price.toFixed(0) ?? '—'} · res $${resistances[0]?.price.toFixed(0) ?? '—'}` };
+  // Ratchet: only move SL in favorable direction
+  if (side === 'buy'  && newSL > (currentSL || -Infinity)) return +newSL.toFixed(1);
+  if (side === 'sell' && newSL < (currentSL || Infinity))  return +newSL.toFixed(1);
+  return currentSL;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  CANDLE PATTERN
+// ═══════════════════════════════════════════════════════════════════
+
+function detectPattern(candles) {
+  if (!candles || candles.length < 3) return null;
+  const c = candles[candles.length-1], p = candles[candles.length-2];
+  const range = (c.h-c.l)||0.001, body = Math.abs(c.c-c.o);
+  const uw = c.h-Math.max(c.c,c.o), lw = Math.min(c.c,c.o)-c.l;
+  if (uw/range > 0.55 && body/range < 0.35 && c.c < p.c) return { dir:'bear', label:'Bearish pin', conf: Math.round(uw/range*100) };
+  if (lw/range > 0.55 && body/range < 0.35 && c.c > p.c) return { dir:'bull', label:'Bullish pin', conf: Math.round(lw/range*100) };
+  if (p.c > p.o && c.c < c.o && c.o >= p.c && c.c <= p.o) return { dir:'bear', label:'Bearish engulf', conf:80 };
+  if (p.c < p.o && c.c > c.o && c.o <= p.c && c.c >= p.o) return { dir:'bull', label:'Bullish engulf', conf:80 };
+  const l3 = candles.slice(-3);
+  const ab = l3.reduce((s,x)=>s+Math.abs(x.c-x.o),0)/3, ar = l3.reduce((s,x)=>s+(x.h-x.l),0)/3;
+  const pr = candles.length>8 ? candles.slice(-8,-3).reduce((s,x)=>s+(x.h-x.l),0)/5 : ar*2;
+  if (ab/(ar||1) < 0.35 && ar < pr*0.55) return { dir:'neutral', label:'Compression', conf:65 };
+  return null;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  SIGNAL ENGINE — combines levels + quant + sweep
+// ═══════════════════════════════════════════════════════════════════
+
+function computeSignal({ candles, markPrice, trades, orderBook, allZones, classified }) {
+  if (!candles || candles.length < 40 || !markPrice) return null;
+  const closes  = candles.map(c => c.c);
+  const atr     = calcATR(candles);
+  const rsiVal  = calcRSI(closes);
+  const pattern = detectPattern(candles);
+  const { supports, resistances, atLevel } = classified;
+
+  // ── Quant models ──────────────────────────────────────────────
+  const kalman = kalmanFilter(closes.slice(-60));
+  const garchR = garch(closes.slice(-80));
+  const hurst  = hurstExponent(closes.slice(-60));
+  const vp     = volumeProfile(candles.slice(-100));
+  const micro  = microstructure(trades, orderBook, 120000);
+
+  // ── Liquidity sweep (highest priority signal) ─────────────────
+  const sweep  = detectLiquiditySweep(candles, allZones, atr);
+
+  // ── Level gate: only trade if AT a significant level ──────────
+  // (unless it's a sweep — sweeps can occur at non-clustered levels)
+  const atSignificantLevel = atLevel.length > 0 && atLevel.some(z => z.strength >= 2);
+
+  // ── Score components ──────────────────────────────────────────
+  const kalmanScore = kalman
+    ? (kalman.velocityPct > 0.02 ? 40 : kalman.velocityPct > 0.008 ? 20 :
+       kalman.velocityPct < -0.02 ? -40 : kalman.velocityPct < -0.008 ? -20 : 0)
+    : 0;
+  const microScore  = micro ? micro.score * 100 : 0;
+  const rsiScore    = rsiVal > 72 ? -30 : rsiVal < 32 ? 30 : rsiVal > 60 ? -10 : rsiVal < 42 ? 10 : 0;
+  const patScore    = pattern?.dir === 'bull' ? pattern.conf * 0.4 : pattern?.dir === 'bear' ? -pattern.conf * 0.4 : 0;
+  const levelBoost  = atSignificantLevel ? 1 + atLevel[0].strength * 0.12 : 0.55;
+  const garchMult   = garchR?.mult || 1.0;
+  const hurstMode   = hurst?.regime || 'RANDOM';
+
+  let rawScore = 0;
+  if (hurstMode === 'TRENDING')
+    rawScore = kalmanScore*0.45 + microScore*0.30 + rsiScore*0.10 + patScore*0.15;
+  else if (hurstMode === 'MEAN_REV')
+    rawScore = kalmanScore*0.15 + microScore*0.20 + rsiScore*0.30 + patScore*0.35;
+  else
+    rawScore = kalmanScore*0.30 + microScore*0.25 + rsiScore*0.25 + patScore*0.20;
+
+  rawScore *= garchMult * levelBoost;
+  const compositeScore = +Math.min(100, Math.max(-100, rawScore)).toFixed(1);
+
+  // Threshold: higher in random walk
+  const threshold = hurstMode === 'TRENDING' ? 22 : hurstMode === 'MEAN_REV' ? 28 : 35;
+
+  // ── Determine signal ──────────────────────────────────────────
+  let signal = 'HOLD', signalSource = 'quant', sweepConf = 0;
+
+  // 1. Liquidity sweep overrides everything (with trend filter)
+  if (sweep) {
+    const trendOk = sweep.direction === 'BUY'
+      ? (kalman?.trend === 'UP' || hurstMode === 'MEAN_REV')
+      : (kalman?.trend === 'DOWN' || hurstMode === 'MEAN_REV');
+    if (trendOk || sweep.sweptLevel.strength >= 3) {
+      signal = sweep.direction; signalSource = 'sweep'; sweepConf = sweep.confidence;
     }
-  },
+  }
 
-  COIL_BREAK: {
-    name: 'Coil & Break', tag: 'CB',
-    desc: 'Compression at a level → trades the breakout. TP/SL = next levels.',
-    minRR: 1.5,
-    evaluate({ candles, markPrice, supports, resistances, atLevel, atr, trend, pattern, rsiVal }) {
-      const closes   = candles.map(c => c.c);
-      const bbW      = calcBBWidth(closes);
-      const isComp   = pattern?.type === 'COMPRESSION';
-      const recentBW = [];
-      for (let i = 25; i <= Math.min(closes.length, 80); i++) recentBW.push(calcBBWidth(closes.slice(0, i)) ?? 0);
-      recentBW.sort((a, b) => a - b);
-      const medBW  = recentBW[Math.floor(recentBW.length * 0.5)] || 0.01;
-      const squeeze = bbW !== null && bbW < medBW * 0.72;
+  // 2. Quant composite (if no sweep)
+  if (signal === 'HOLD') {
+    if (compositeScore > threshold && atSignificantLevel) { signal = 'BUY';  signalSource = 'quant'; }
+    if (compositeScore < -threshold && atSignificantLevel) { signal = 'SELL'; signalSource = 'quant'; }
+  }
 
-      if (!isComp && !squeeze) return { signal: 'HOLD', score: 0, reason: `No compression · BBW ${bbW?.toFixed(4) ?? '—'}` };
-      if (!atLevel.length)     return { signal: 'HOLD', score: 0, reason: `Compression but not at a key level` };
-
-      const base = 45 + (isComp ? 20 : 0) + (squeeze ? 18 : 0);
-
-      // Compression at any level → direction determined by trend
-      for (const z of atLevel) {
-        if (trend.dir === 'DOWN' || trend.dir === 'NEUTRAL') {
-          const score = base + z.strength * 12 + (trend.dir === 'DOWN' ? 18 : 0);
-          const targets = getLevelTargets({ markPrice, side: 'sell', supports, resistances, atr, minRR: this.minRR });
-          if (!targets.valid) continue;
-          return { signal: 'SELL', score, ...targets,
-            reason: `Coil at $${z.price.toFixed(0)} · Squeeze · Drop expected · Trend ${trend.dir}` };
-        }
-        if (trend.dir === 'UP' || trend.dir === 'NEUTRAL') {
-          const score = base + z.strength * 12 + (trend.dir === 'UP' ? 18 : 0);
-          const targets = getLevelTargets({ markPrice, side: 'buy', supports, resistances, atr, minRR: this.minRR });
-          if (!targets.valid) continue;
-          return { signal: 'BUY', score, ...targets,
-            reason: `Coil at $${z.price.toFixed(0)} · Squeeze · Spring expected · Trend ${trend.dir}` };
-        }
-      }
-      return { signal: 'HOLD', score: 0, reason: `Compression at level · Waiting for trend clarity` };
+  // 3. Level bounce fallback (no quant score needed, just pattern + level + trend)
+  if (signal === 'HOLD' && atSignificantLevel && pattern) {
+    const trend = kalman?.trend || 'FLAT';
+    if (pattern.dir === 'bull' && (trend === 'UP' || hurstMode === 'MEAN_REV') && rsiVal < 62) {
+      signal = 'BUY'; signalSource = 'level_bounce';
     }
-  },
-
-  TREND_PULLBACK: {
-    name: 'Trend Pullback', tag: 'TP',
-    desc: 'Strong trend → pullback to nearest level → continuation entry. TP = previous swing.',
-    minRR: 1.8,
-    evaluate({ candles, markPrice, supports, resistances, atLevel, atr, trend, pattern, rsiVal }) {
-      if (trend.strength < 3) return { signal: 'HOLD', score: 0, reason: `Trend str ${trend.strength}/4 — need ≥3 for continuation` };
-
-      if (trend.dir === 'UP') {
-        // Pullback to support, RSI cooled, bullish pattern
-        for (const z of atLevel) {
-          const rsiOk = rsiVal < 52;
-          const bull  = pattern?.dir === 'bull';
-          const score = 50 + trend.strength * 12 + z.strength * 12 + (rsiOk ? 15 : 0) + (bull ? 15 : 0);
-          const targets = getLevelTargets({ markPrice, side: 'buy', supports, resistances, atr, minRR: this.minRR });
-          if (!targets.valid) return { signal: 'HOLD', score: 0, reason: `Pullback to $${z.price.toFixed(0)} · R:R ${targets.rr ?? '—'} < ${this.minRR}` };
-          return { signal: 'BUY', score, ...targets,
-            reason: `Uptrend pullback to $${z.price.toFixed(0)} · RSI ${rsiVal.toFixed(1)} · Trend str ${trend.strength}/4` };
-        }
-        return { signal: 'HOLD', score: 0, reason: `Strong uptrend · Waiting for pullback to a level` };
-      }
-
-      if (trend.dir === 'DOWN') {
-        for (const z of atLevel) {
-          const rsiOk = rsiVal > 52;
-          const bear  = pattern?.dir === 'bear';
-          const score = 50 + trend.strength * 12 + z.strength * 12 + (rsiOk ? 15 : 0) + (bear ? 15 : 0);
-          const targets = getLevelTargets({ markPrice, side: 'sell', supports, resistances, atr, minRR: this.minRR });
-          if (!targets.valid) return { signal: 'HOLD', score: 0, reason: `Bounce to $${z.price.toFixed(0)} · R:R ${targets.rr ?? '—'} < ${this.minRR}` };
-          return { signal: 'SELL', score, ...targets,
-            reason: `Downtrend bounce to $${z.price.toFixed(0)} · RSI ${rsiVal.toFixed(1)} · Trend str ${trend.strength}/4` };
-        }
-        return { signal: 'HOLD', score: 0, reason: `Strong downtrend · Waiting for bounce to a level` };
-      }
-
-      return { signal: 'HOLD', score: 0, reason: `Trend NEUTRAL` };
+    if (pattern.dir === 'bear' && (trend === 'DOWN' || hurstMode === 'MEAN_REV') && rsiVal > 42) {
+      signal = 'SELL'; signalSource = 'level_bounce';
     }
-  },
+  }
 
-  COMPOSITE: {
-    name: 'Composite ★', tag: 'ALL',
-    desc: 'Runs all strategies. Best score wins. Levels always dynamic.',
-    evaluate(ctx) {
-      const results = [
-        { key: 'LB', ...STRATEGIES.LEVEL_BOUNCE.evaluate(ctx) },
-        { key: 'CB', ...STRATEGIES.COIL_BREAK.evaluate(ctx) },
-        { key: 'TP', ...STRATEGIES.TREND_PULLBACK.evaluate(ctx) },
-      ];
-      const active = results.filter(r => r.signal !== 'HOLD').sort((a, b) => b.score - a.score);
-      if (!active.length) return { signal: 'HOLD', score: 0, reason: results.map(r => `[${r.key}] ${r.reason}`).join(' · ') };
-      const best = active[0];
-      return { ...best, reason: `[${best.key}] ${best.reason}` };
+  // ── Build targets ─────────────────────────────────────────────
+  let tp = null, sl = null, rr = null, tpAdjusted = false, tpReason = '';
+  if (signal !== 'HOLD') {
+    const side = signal === 'BUY' ? 'buy' : 'sell';
+    // Initial TP = next level
+    if (side === 'buy' && resistances[0]) tp = resistances[0].price;
+    if (side === 'sell' && supports[0])   tp = supports[0].price;
+    // Initial SL = level that invalidates, with buffer
+    if (side === 'buy' && supports[0])
+      sl = supports[0].price - (atr ? atr * 0.3 : markPrice * 0.001);
+    if (side === 'sell' && resistances[0])
+      sl = resistances[0].price + (atr ? atr * 0.3 : markPrice * 0.001);
+
+    // Dynamic TP check
+    if (tp) {
+      const dynTP = getDynamicTP({ markPrice, side, originalTP: tp, supports, resistances, allZones, atr });
+      if (dynTP.adjusted) { tp = dynTP.tp; tpAdjusted = true; tpReason = dynTP.reason; }
     }
-  },
-};
+
+    // R:R check
+    if (tp && sl) {
+      const rew = side === 'buy' ? tp - markPrice : markPrice - tp;
+      const risk = side === 'buy' ? markPrice - sl : sl - markPrice;
+      rr = risk > 0 ? +(rew / risk).toFixed(2) : null;
+    }
+    // Reject if R:R < 1.4 (unless sweep — sweeps allow 1.2 because high confidence)
+    const minRR = signalSource === 'sweep' ? 1.2 : 1.4;
+    if (!rr || rr < minRR) signal = 'HOLD';
+  }
+
+  return {
+    signal, compositeScore, threshold, signalSource, sweepConf,
+    sweep, models: { kalman, garchR, hurst, vp, micro },
+    scores: { kalmanScore: +kalmanScore.toFixed(1), microScore: +microScore.toFixed(1), rsiScore, patScore: +patScore.toFixed(1) },
+    hurstMode, garchMult, atLevel, atSignificantLevel, pattern,
+    tp, sl, rr, tpAdjusted, tpReason,
+    valid: signal !== 'HOLD' && tp !== null && sl !== null,
+    reason: buildReason({ signal, compositeScore, signalSource, sweep, kalman, garchR, hurst, micro, atLevel, pattern, rsiVal, tp, sl, rr }),
+  };
+}
+
+function buildReason({ signal, compositeScore, signalSource, sweep, kalman, garchR, hurst, micro, atLevel, pattern, rsiVal, tp, sl, rr }) {
+  const parts = [];
+  if (signalSource === 'sweep' && sweep) parts.push(`SWEEP: ${sweep.entryNote}`);
+  if (hurst)   parts.push(`H=${hurst.H}[${hurst.regime}]`);
+  if (garchR)  parts.push(`GARCH:${garchR.regime}`);
+  if (kalman)  parts.push(`K:${kalman.trend} v=${kalman.velocityPct.toFixed(3)}%`);
+  if (micro)   parts.push(`Flow:${micro.bias} δ=${micro.deltaRatio.toFixed(2)}`);
+  if (atLevel.length) parts.push(`Level:$${atLevel[0].price.toFixed(0)}×${atLevel[0].strength}`);
+  if (pattern) parts.push(pattern.label);
+  parts.push(`RSI:${rsiVal?.toFixed(1)}`);
+  parts.push(`Score:${compositeScore}`);
+  if (rr) parts.push(`R:R=${rr}`);
+  return parts.join(' · ');
+}
 
 // ═══════════════════════════════════════════════════════════════════
 //  HOOK
 // ═══════════════════════════════════════════════════════════════════
 
-export function useTradingBot({ candles, markPrice, openPosition, closePosition, positions, log }) {
-  const [running, setRunning]           = useState(false);
-  const [activeStrat, setActiveStrat]   = useState('COMPOSITE');
-  const [signal, setSignal]             = useState('HOLD');
-  const [lastEval, setLastEval]         = useState(null);
-  const [stats, setStats]               = useState({ trades: 0, wins: 0, losses: 0, totalPnl: 0 });
-  const [botLog, setBotLog]             = useState([]);
-  // All levels as a unified pool — role assigned dynamically
-  const [allZones, setAllZones]         = useState([]);
-  const [classified, setClassified]     = useState({ supports: [], resistances: [], atLevel: [] });
+export function useTradingBot({ candles, markPrice, trades, orderBook, openPosition, closePosition, positions, log }) {
+  const [running, setRunning]       = useState(false);
+  const [lastResult, setLastResult] = useState(null);
+  const [stats, setStats]           = useState({ trades:0, wins:0, losses:0, totalPnl:0, sweepTrades:0 });
+  const [botLog, setBotLog]         = useState([]);
+  const [allZones, setAllZones]     = useState([]);
+  const [classified, setClassified] = useState({ supports:[], resistances:[], atLevel:[] });
+  const [vpData, setVpData]         = useState(null);
 
   const botPosIdRef   = useRef(null);
-  const activeTpRef   = useRef(null);
-  const activeSlRef   = useRef(null);
+  const activeTpRef   = useRef(null);   // current TP (may be adjusted)
+  const originalTpRef = useRef(null);   // original TP from entry
+  const activeSlRef   = useRef(null);   // current SL (trailing)
   const activeSideRef = useRef(null);
+  const entryPriceRef = useRef(null);
   const intervalRef   = useRef(null);
+  const trailActiveRef = useRef(false); // start trailing only after price moves in our favor
 
   const addLog = useCallback((msg, type = 'info') => {
     const ts = new Date().toLocaleTimeString();
-    setBotLog(l => [{ ts, msg, type }, ...l].slice(0, 100));
+    setBotLog(l => [{ ts, msg, type }, ...l].slice(0, 120));
     if (log) log(`[BOT] ${msg}`, type);
   }, [log]);
 
-  // Rebuild zone pool when candles change
+  // Rebuild levels
   useEffect(() => {
-    if (!candles || candles.length < 30) return;
-    const points = findSwingPoints(candles.slice(-200), 4);
-    const zones  = clusterLevels(points);
-    setAllZones(zones);
+    if (!candles || candles.length < 20) return;
+    const vp    = volumeProfile(candles.slice(-100));
+    setVpData(vp);
+    setAllZones(buildAllLevels(candles, vp));
   }, [candles]);
 
-  // Re-classify zones whenever price or zones change — THIS is the dynamic role reversal
+  // Reclassify on price change (dynamic role reversal)
   useEffect(() => {
     if (!allZones.length || !markPrice) return;
     const atr = calcATR(candles);
-    const { supports, resistances } = classifyLevels(allZones, markPrice, atr);
-    const atLevel = getLevelsAtPrice(allZones, markPrice, atr);
-    setClassified({ supports, resistances, atLevel });
+    setClassified(classifyLevels(allZones, markPrice, atr));
   }, [allZones, markPrice, candles]);
 
   const tick = useCallback(() => {
-    if (!candles || candles.length < 60 || !markPrice) return;
+    if (!candles || candles.length < 40 || !markPrice) return;
 
-    const closes  = candles.map(c => c.c);
-    const atr     = calcATR(candles);
-    const trend   = getTrend(candles, markPrice);
-    const pattern = detectPattern(candles);
-    const rsiVal  = calcRSI(closes);
-    const { supports, resistances, atLevel } = classified;
-
-    const strat  = STRATEGIES[activeStrat];
-    const result = strat.evaluate({ candles, markPrice, supports, resistances, atLevel, atr, trend, pattern, rsiVal });
-    setSignal(result.signal);
-    setLastEval(result);
+    const result = computeSignal({ candles, markPrice, trades, orderBook, allZones, classified });
+    if (!result) return;
+    setLastResult(result);
 
     const hasOpenPos = botPosIdRef.current !== null && positions.some(p => p.id === botPosIdRef.current);
+    const atr        = calcATR(candles);
+    const { supports, resistances } = classified;
 
     // ── Manage open position ──────────────────────────────────
-    if (hasOpenPos && activeTpRef.current && activeSlRef.current) {
+    if (hasOpenPos) {
       const pos  = positions.find(p => p.id === botPosIdRef.current);
       if (pos) {
         const side  = activeSideRef.current;
-        const hitTP = side === 'buy' ? markPrice >= activeTpRef.current : markPrice <= activeTpRef.current;
-        const hitSL = side === 'buy' ? markPrice <= activeSlRef.current : markPrice >= activeSlRef.current;
+        const entry = entryPriceRef.current || pos.entry;
 
-        // Level invalidation: if a support the trade depends on has now become resistance
-        // (i.e. price broke below it), exit early
-        const invalidated = side === 'buy'
-          ? resistances.some(z => z.price > pos.entry * 0.999 && z.price < pos.entry * 1.001 && markPrice < z.price)
-          : supports.some(z => z.price > pos.entry * 0.999 && z.price < pos.entry * 1.001 && markPrice > z.price);
+        // Activate trailing SL once price moves 1 ATR in our favor
+        if (!trailActiveRef.current && atr) {
+          const moved = side === 'buy' ? markPrice - entry : entry - markPrice;
+          if (moved >= atr) { trailActiveRef.current = true; addLog('Trailing SL activated', 'muted'); }
+        }
 
-        if (hitTP || hitSL || invalidated) {
+        // Update trailing SL
+        if (trailActiveRef.current && atr) {
+          const newSL = getTrailingSL({ markPrice, side, currentSL: activeSlRef.current, entryPrice: entry, atr, supports, resistances });
+          if (newSL !== activeSlRef.current) {
+            activeSlRef.current = newSL;
+            addLog(`Trail SL → $${newSL.toFixed(1)}`, 'muted');
+          }
+        }
+
+        // Dynamic TP update: scan for new levels in path
+        if (activeTpRef.current && atr) {
+          const dynTP = getDynamicTP({ markPrice, side, originalTP: originalTpRef.current,
+            supports, resistances, allZones, atr });
+          if (dynTP.adjusted && dynTP.tp !== activeTpRef.current) {
+            activeTpRef.current = dynTP.tp;
+            addLog(`Dynamic TP → $${dynTP.tp.toFixed(1)} · ${dynTP.reason}`, 'warn');
+          }
+        }
+
+        // Exit checks
+        const hitTP  = side === 'buy' ? markPrice >= activeTpRef.current : markPrice <= activeTpRef.current;
+        const hitSL  = side === 'buy' ? markPrice <= activeSlRef.current : markPrice >= activeSlRef.current;
+        const kExit  = result.models.kalman && (
+          (side === 'buy'  && result.models.kalman.velocityPct < -0.035) ||
+          (side === 'sell' && result.models.kalman.velocityPct >  0.035));
+
+        if (hitTP || hitSL || kExit) {
           const pnl = side === 'buy'
-            ? pos.qty * (markPrice - pos.entry)
-            : pos.qty * (pos.entry - markPrice);
+            ? pos.qty * (markPrice - entry)
+            : pos.qty * (entry - markPrice);
           closePosition(botPosIdRef.current);
-          setStats(s => ({ ...s, trades: s.trades + 1,
-            wins: pnl > 0 ? s.wins + 1 : s.wins,
-            losses: pnl <= 0 ? s.losses + 1 : s.losses,
+          setStats(s => ({ ...s, trades: s.trades+1,
+            wins: pnl>0 ? s.wins+1 : s.wins, losses: pnl<=0 ? s.losses+1 : s.losses,
             totalPnl: s.totalPnl + pnl }));
-          const why = hitTP ? 'TP — next level hit' : invalidated ? 'Level role reversed — invalidated' : 'SL — level broken';
-          addLog(`EXIT · ${why} · PnL ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}`, pnl > 0 ? 'success' : 'danger');
-          botPosIdRef.current = null; activeTpRef.current = null;
+          const why = hitTP ? 'TP hit' : kExit ? 'Kalman reversal' : 'SL hit';
+          addLog(`EXIT [${why}] ${pnl>=0?'+':''}$${pnl.toFixed(2)} @ $${markPrice.toFixed(1)}`, pnl>0?'success':'danger');
+          botPosIdRef.current = null; activeTpRef.current = null; originalTpRef.current = null;
           activeSlRef.current = null; activeSideRef.current = null;
-          return;
+          entryPriceRef.current = null; trailActiveRef.current = false;
         }
       }
     }
 
     // ── Enter ──────────────────────────────────────────────────
-    if (!hasOpenPos && result.signal !== 'HOLD' && result.tp && result.sl) {
+    if (!hasOpenPos && result.valid) {
       const side = result.signal === 'BUY' ? 'buy' : 'sell';
       openPosition(side, null);
-      botPosIdRef.current   = Date.now();
+      const id = Date.now();
+      botPosIdRef.current   = id;
       activeTpRef.current   = result.tp;
+      originalTpRef.current = result.tp;
       activeSlRef.current   = result.sl;
       activeSideRef.current = side;
-      addLog(`${result.signal} · Score ${result.score} · R:R ${result.rr} · ${result.reason}`, side === 'buy' ? 'success' : 'warn');
-      addLog(`  TP $${result.tp.toFixed(1)} · SL $${result.sl.toFixed(1)}`, 'muted');
+      entryPriceRef.current = markPrice;
+      trailActiveRef.current = false;
+      if (result.signalSource === 'sweep') setStats(s => ({ ...s, sweepTrades: s.sweepTrades+1 }));
+      addLog(`${result.signal} [${result.signalSource.toUpperCase()}] Score:${result.compositeScore} R:R:${result.rr}`, side==='buy'?'success':'warn');
+      if (result.tpAdjusted) addLog(`  TP adjusted: ${result.tpReason}`, 'warn');
+      addLog(`  TP:$${result.tp?.toFixed(1)} SL:$${result.sl?.toFixed(1)} · ${result.reason}`, 'muted');
     }
-  }, [candles, markPrice, openPosition, closePosition, positions, activeStrat, classified, addLog]);
+  }, [candles, markPrice, trades, orderBook, openPosition, closePosition, positions, allZones, classified, addLog]);
 
   useEffect(() => {
     if (running) { intervalRef.current = setInterval(tick, 4000); }
@@ -465,27 +613,23 @@ export function useTradingBot({ candles, markPrice, openPosition, closePosition,
     return () => clearInterval(intervalRef.current);
   }, [running, tick]);
 
-  const start = useCallback((strat) => {
-    if (strat) setActiveStrat(strat);
+  const start = useCallback(() => {
     setRunning(true);
-    addLog(`Started · ${STRATEGIES[strat || activeStrat].name} · Dynamic level roles`, 'success');
-  }, [activeStrat, addLog]);
-
-  const stop  = useCallback(() => { setRunning(false); addLog('Stopped', 'warn'); }, [addLog]);
+    addLog('Engine started · Levels + Quant + Sweep + Dynamic TP + Trail SL', 'success');
+  }, [addLog]);
+  const stop  = useCallback(() => { setRunning(false); addLog('Stopped','warn'); }, [addLog]);
   const reset = useCallback(() => {
     setRunning(false);
-    setStats({ trades: 0, wins: 0, losses: 0, totalPnl: 0 });
-    setBotLog([]);
-    botPosIdRef.current = null; activeTpRef.current = null;
-    activeSlRef.current = null; activeSideRef.current = null;
-    addLog('Reset', 'muted');
+    setStats({ trades:0, wins:0, losses:0, totalPnl:0, sweepTrades:0 }); setBotLog([]);
+    botPosIdRef.current=null; activeTpRef.current=null; originalTpRef.current=null;
+    activeSlRef.current=null; activeSideRef.current=null; entryPriceRef.current=null;
+    trailActiveRef.current=false; addLog('Reset','muted');
   }, [addLog]);
 
-  const winRate = (stats.wins + stats.losses) > 0
-    ? Math.round(stats.wins / (stats.wins + stats.losses) * 100) : null;
+  const winRate = (stats.wins+stats.losses) > 0
+    ? Math.round(stats.wins/(stats.wins+stats.losses)*100) : null;
 
-  return { running, signal, lastEval, stats, botLog, winRate,
-           allZones, classified, activeStrat, setActiveStrat, start, stop, reset };
+  return { running, lastResult, stats, botLog, winRate, allZones, classified, vpData, start, stop, reset };
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -495,204 +639,284 @@ export function useTradingBot({ candles, markPrice, openPosition, closePosition,
 const SIG_COLOR  = { BUY:'#00ffe1', SELL:'#ff7ab0', HOLD:'#94a3b8' };
 const SIG_BG     = { BUY:'rgba(0,255,209,0.07)', SELL:'rgba(255,92,158,0.07)', HOLD:'rgba(148,163,184,0.04)' };
 const SIG_BORDER = { BUY:'rgba(0,255,209,0.2)', SELL:'rgba(255,92,158,0.2)', HOLD:'rgba(148,163,184,0.08)' };
+const H_COL = { TRENDING:'#34d399', MEAN_REV:'#f87171', RANDOM:'#fbbf24' };
+const G_COL = { EXPANDING:'#f87171', CONTRACTING:'#34d399', STABLE:'#94a3b8' };
+const SRC_COL = { sweep:'#fbbf24', quant:'#9ddfff', level_bounce:'#34d399' };
+
+function Bar({ val, max=100, color='#00ffe1' }) {
+  const pct = Math.min(100, Math.abs(val||0)/max*100);
+  return (
+    <div style={{ display:'flex', alignItems:'center', gap:5, height:12 }}>
+      <div style={{ flex:1, height:3, background:'rgba(255,255,255,0.05)', borderRadius:2, overflow:'hidden' }}>
+        <div style={{ width:`${pct}%`, height:'100%', background:color, borderRadius:2, transition:'width .4s' }}/>
+      </div>
+      <span style={{ fontSize:10, color, minWidth:34, textAlign:'right', fontWeight:700 }}>
+        {(val||0)>0?'+':''}{+(val||0).toFixed(1)}
+      </span>
+    </div>
+  );
+}
 
 export const BotPanel = forwardRef(function BotPanel(
-  { candles, markPrice, openPosition, closePosition, positions, log }, ref
+  { candles, markPrice, trades, orderBook, openPosition, closePosition, positions, log }, ref
 ) {
-  const bot = useTradingBot({ candles, markPrice, openPosition, closePosition, positions, log });
-  const { running, signal, lastEval, stats, botLog, winRate,
-          allZones, classified, activeStrat, setActiveStrat, start, stop, reset } = bot;
-
+  const bot = useTradingBot({ candles, markPrice, trades, orderBook, openPosition, closePosition, positions, log });
+  const { running, lastResult, stats, botLog, winRate, allZones, classified, vpData, start, stop, reset } = bot;
   useImperativeHandle(ref, () => ({ start, stop, reset }), [start, stop, reset]);
 
+  const [showModels, setShowModels] = useState(true);
   const [showLevels, setShowLevels] = useState(false);
 
-  const closes = useMemo(() => (candles || []).map(c => c.c).filter(Boolean), [candles]);
-  const atr    = useMemo(() => calcATR(candles), [candles]);
-  const rsiVal = useMemo(() => calcRSI(closes), [closes]);
-  const trend  = useMemo(() => candles?.length >= 22 ? getTrend(candles, markPrice) : null, [candles, markPrice]);
-  const trendCol = d => d === 'UP' ? '#34d399' : d === 'DOWN' ? '#f87171' : '#94a3b8';
-  const scoreCol = s => s >= 80 ? '#00ffe1' : s >= 55 ? '#fbbf24' : '#94a3b8';
-
+  const sig = lastResult?.signal || 'HOLD';
+  const m   = lastResult?.models || {};
+  const sc  = lastResult?.scores || {};
   const { supports, resistances, atLevel } = classified;
 
   return (
     <div style={{ display:'flex', flexDirection:'column' }}>
       <div className="phdr" style={{ display:'flex', justifyContent:'space-between', alignItems:'center' }}>
-        <span>Auto Bot</span>
+        <span>Quant Bot v5</span>
         <div style={{ display:'flex', alignItems:'center', gap:6 }}>
-          <span style={{ fontSize:9, color: running ? '#34d399':'#475569', letterSpacing:'.1em' }}>{running?'RUNNING':'IDLE'}</span>
-          <div style={{ width:6, height:6, borderRadius:'50%', background: running?'#34d399':'#475569',
-            boxShadow: running?'0 0 5px #34d399':'none', animation: running?'pulse 1.8s infinite':'none' }} />
+          {lastResult?.signalSource && lastResult.signal !== 'HOLD' && (
+            <span style={{ fontSize:9, fontWeight:700, color:SRC_COL[lastResult.signalSource]||'#94a3b8',
+              background:'rgba(255,255,255,0.04)', padding:'1px 6px', borderRadius:10 }}>
+              {lastResult.signalSource.toUpperCase()}
+            </span>
+          )}
+          <div style={{ width:6, height:6, borderRadius:'50%', background:running?'#34d399':'#475569',
+            boxShadow:running?'0 0 5px #34d399':'none', animation:running?'pulse 1.8s infinite':'none' }}/>
         </div>
       </div>
 
-      <div style={{ padding:'8px 10px', display:'flex', flexDirection:'column', gap:8 }}>
+      <div style={{ padding:'8px 10px', display:'flex', flexDirection:'column', gap:7 }}>
 
-        {/* Strategy selector */}
-        <div style={{ display:'flex', flexDirection:'column', gap:3 }}>
-          <div style={{ fontSize:10, color:'#475569', marginBottom:1 }}>Strategy</div>
-          {Object.entries(STRATEGIES).map(([key, s]) => (
-            <button key={key} className={`btn ${activeStrat===key?'btn-on':''}`}
-              style={{ textAlign:'left', padding:'5px 9px', fontSize:11, width:'100%', borderRadius:7 }}
-              onClick={() => { setActiveStrat(key); if (running) { stop(); setTimeout(() => start(key), 80); } }}>
-              <span style={{ fontWeight:700 }}>[{s.tag}] {s.name}</span>
-              <div style={{ fontSize:9, color: activeStrat===key?'#7acfff':'#334155', marginTop:2 }}>{s.desc}</div>
-            </button>
-          ))}
-        </div>
-
-        {/* Signal + Trend */}
-        <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:6 }}>
-          <div style={{ background:SIG_BG[signal], border:`1px solid ${SIG_BORDER[signal]}`, borderRadius:8, padding:'7px 10px' }}>
-            <div style={{ fontSize:9, color:'#475569' }}>Signal</div>
-            <div style={{ fontWeight:800, fontSize:17, color:SIG_COLOR[signal] }}>{signal}</div>
-            {lastEval?.score > 0 && <div style={{ fontSize:10, color:scoreCol(lastEval.score) }}>Score {lastEval.score}</div>}
-          </div>
-          <div style={{ background:'rgba(255,255,255,0.02)', border:'1px solid rgba(255,255,255,0.04)', borderRadius:8, padding:'7px 10px' }}>
-            <div style={{ fontSize:9, color:'#475569' }}>Trend</div>
-            <div style={{ fontWeight:800, fontSize:17, color:trendCol(trend?.dir) }}>{trend?.dir ?? '—'}</div>
-            <div style={{ fontSize:10, color:'#475569' }}>str {trend?.strength ?? '—'}/4</div>
-          </div>
-        </div>
-
-        {/* At-level alert — shows all levels currently being tested */}
-        {atLevel.length > 0 && (
+        {/* Sweep alert */}
+        {lastResult?.sweep && (
           <div style={{ padding:'6px 10px', borderRadius:7, fontSize:11, fontWeight:700,
-            background:'rgba(251,191,36,0.07)', border:'1px solid rgba(251,191,36,0.2)', color:'#fbbf24' }}>
-            TESTING LEVEL{atLevel.length > 1 ? 'S' : ''}: {atLevel.map(z => `$${z.price.toFixed(0)} ×${z.strength}`).join(' · ')}
-            <div style={{ fontSize:9, fontWeight:400, color:'#856c1a', marginTop:2 }}>
-              Role = {markPrice > atLevel[0].price ? 'SUPPORT (breakout retest)' : 'RESISTANCE (rejection zone)'}
-            </div>
+            background:'rgba(251,191,36,0.1)', border:'1px solid rgba(251,191,36,0.3)', color:'#fbbf24' }}>
+            SWEEP DETECTED · {lastResult.sweep.type} · conf {lastResult.sweep.confidence}%
+            <div style={{ fontSize:9, fontWeight:400, color:'#856c1a', marginTop:2 }}>{lastResult.sweep.entryNote}</div>
           </div>
         )}
 
-        {/* Reason */}
-        {lastEval?.reason && (
-          <div style={{ fontSize:10, color:'#5b7e93', background:'rgba(0,0,0,0.18)', padding:'5px 8px', borderRadius:5, lineHeight:1.7 }}>
-            {lastEval.reason}
+        {/* Signal row */}
+        <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr 1fr', gap:5 }}>
+          <div style={{ background:SIG_BG[sig], border:`1px solid ${SIG_BORDER[sig]}`, borderRadius:8, padding:'7px 9px' }}>
+            <div style={{ fontSize:9, color:'#475569' }}>Signal</div>
+            <div style={{ fontWeight:800, fontSize:17, color:SIG_COLOR[sig] }}>{sig}</div>
+            <div style={{ fontSize:9, color:SRC_COL[lastResult?.signalSource]||'#334155' }}>
+              {lastResult?.signalSource?.replace('_',' ') || '—'}
+            </div>
+          </div>
+          <div style={{ background:'rgba(255,255,255,0.02)', border:'1px solid rgba(255,255,255,0.04)', borderRadius:8, padding:'7px 9px' }}>
+            <div style={{ fontSize:9, color:'#475569' }}>Score</div>
+            <div style={{ fontWeight:800, fontSize:17, color:(lastResult?.compositeScore||0)>0?'#00ffe1':(lastResult?.compositeScore||0)<0?'#ff7ab0':'#94a3b8' }}>
+              {lastResult?.compositeScore ?? '—'}
+            </div>
+            <div style={{ fontSize:9, color:'#334155' }}>±{lastResult?.threshold ?? '—'}</div>
+          </div>
+          <div style={{ background:'rgba(255,255,255,0.02)', border:'1px solid rgba(255,255,255,0.04)', borderRadius:8, padding:'7px 9px' }}>
+            <div style={{ fontSize:9, color:'#475569' }}>Hurst</div>
+            <div style={{ fontWeight:800, fontSize:13, color:H_COL[lastResult?.hurstMode]||'#94a3b8' }}>
+              {m.hurst?.H ?? '—'}
+            </div>
+            <div style={{ fontSize:9, color:H_COL[lastResult?.hurstMode]||'#334155' }}>
+              {lastResult?.hurstMode?.replace('_',' ') || '—'}
+            </div>
+          </div>
+        </div>
+
+        {/* At-level alert */}
+        {atLevel.length > 0 && (
+          <div style={{ padding:'5px 9px', borderRadius:6, fontSize:10, fontWeight:700,
+            background:'rgba(251,191,36,0.06)', border:'1px solid rgba(251,191,36,0.18)', color:'#fbbf24' }}>
+            AT LEVEL: {atLevel.map(z=>`$${z.price.toFixed(0)} [${z.source||''}×${z.strength}]`).join(' · ')}
           </div>
         )}
 
         {/* TP / SL / R:R */}
-        {lastEval?.tp && (
-          <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr 1fr', gap:5 }}>
-            <div style={{ background:'rgba(0,255,209,0.04)', border:'1px solid rgba(0,255,209,0.1)', borderRadius:6, padding:'5px 7px', textAlign:'center' }}>
-              <div style={{ fontSize:9, color:'#475569' }}>TP (next lvl)</div>
-              <div style={{ fontSize:11, fontWeight:700, color:'#34d399' }}>${lastEval.tp.toFixed(0)}</div>
-            </div>
-            <div style={{ background:'rgba(248,113,113,0.04)', border:'1px solid rgba(248,113,113,0.1)', borderRadius:6, padding:'5px 7px', textAlign:'center' }}>
-              <div style={{ fontSize:9, color:'#475569' }}>SL (invalidate)</div>
-              <div style={{ fontSize:11, fontWeight:700, color:'#f87171' }}>${lastEval.sl?.toFixed(0)}</div>
-            </div>
-            <div style={{ background:'rgba(251,191,36,0.04)', border:'1px solid rgba(251,191,36,0.1)', borderRadius:6, padding:'5px 7px', textAlign:'center' }}>
-              <div style={{ fontSize:9, color:'#475569' }}>R:R</div>
-              <div style={{ fontSize:11, fontWeight:700, color: lastEval.rr >= 2?'#34d399':lastEval.rr >= 1.5?'#fbbf24':'#f87171' }}>
-                {lastEval.rr ?? '—'}
+        <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr 1fr', gap:5 }}>
+          {[
+            ['TP'+(lastResult?.tpAdjusted?' ✦':''), lastResult?.tp?.toFixed(0), '#34d399'],
+            ['Trail SL', lastResult?.sl?.toFixed(0), '#f87171'],
+            ['R:R', lastResult?.rr, lastResult?.rr>=2?'#34d399':lastResult?.rr>=1.5?'#fbbf24':'#f87171'],
+          ].map(([l,v,c]) => (
+            <div key={l} style={{ borderRadius:6, padding:'5px 6px', textAlign:'center',
+              background:'rgba(255,255,255,0.02)', border:'1px solid rgba(255,255,255,0.04)' }}>
+              <div style={{ fontSize:9, color:'#475569' }}>{l}</div>
+              <div style={{ fontSize:12, fontWeight:700, color:c }}>
+                {v ? `$${v}` : '—'}
               </div>
             </div>
+          ))}
+        </div>
+        {lastResult?.tpAdjusted && (
+          <div style={{ fontSize:9, color:'#856c1a', lineHeight:1.5, padding:'3px 6px',
+            background:'rgba(251,191,36,0.04)', borderRadius:5 }}>✦ {lastResult.tpReason}</div>
+        )}
+
+        {/* Model toggle */}
+        <button className={`btn ${showModels?'btn-on':''}`}
+          style={{ fontSize:10, padding:'4px 8px', textAlign:'left' }}
+          onClick={() => setShowModels(s=>!s)}>
+          {showModels?'▾':'▸'} Model readouts
+        </button>
+
+        {showModels && (
+          <div style={{ display:'flex', flexDirection:'column', gap:5 }}>
+
+            {/* Hurst bar */}
+            <div style={{ background:'rgba(255,255,255,0.02)', borderRadius:7, padding:'6px 9px', border:'1px solid rgba(255,255,255,0.03)' }}>
+              <div style={{ display:'flex', justifyContent:'space-between', marginBottom:3 }}>
+                <span style={{ fontSize:10, color:'#475569' }}>Hurst — market regime</span>
+                <span style={{ fontSize:10, fontWeight:700, color:H_COL[m.hurst?.regime]||'#94a3b8' }}>{m.hurst?.conf||'—'}</span>
+              </div>
+              <div style={{ position:'relative', height:6, background:'rgba(255,255,255,0.05)', borderRadius:3 }}>
+                <div style={{ position:'absolute', left:'45%', top:0, width:1, height:'100%', background:'rgba(255,255,255,0.15)' }}/>
+                <div style={{ position:'absolute', left:'55%', top:0, width:1, height:'100%', background:'rgba(255,255,255,0.15)' }}/>
+                {m.hurst && <div style={{ width:`${m.hurst.H*100}%`, height:'100%',
+                  background:H_COL[m.hurst.regime], borderRadius:3, transition:'width .5s' }}/>}
+              </div>
+              <div style={{ display:'flex', justifyContent:'space-between', fontSize:9, color:'#334155', marginTop:2 }}>
+                <span>mean-rev</span><span>random</span><span>trending</span>
+              </div>
+            </div>
+
+            {/* GARCH */}
+            <div style={{ background:'rgba(255,255,255,0.02)', borderRadius:7, padding:'6px 9px', border:'1px solid rgba(255,255,255,0.03)' }}>
+              <div style={{ display:'flex', justifyContent:'space-between', marginBottom:2 }}>
+                <span style={{ fontSize:10, color:'#475569' }}>GARCH volatility</span>
+                <span style={{ fontSize:10, fontWeight:700, color:G_COL[m.garchR?.regime]||'#94a3b8' }}>{m.garchR?.regime||'—'}</span>
+              </div>
+              <div style={{ display:'flex', gap:10, fontSize:11 }}>
+                <span style={{ color:'#94a3b8' }}>Vol <b style={{ color:'#e6faff' }}>{m.garchR?.currentVol??'—'}%</b></span>
+                <span style={{ color:'#94a3b8' }}>Δ <b style={{ color:(m.garchR?.volChangePct||0)>0?'#f87171':'#34d399' }}>
+                  {m.garchR?.volChangePct??'—'}%</b></span>
+                <span style={{ color:'#475569' }}>×{lastResult?.garchMult??'—'}</span>
+              </div>
+            </div>
+
+            {/* Kalman */}
+            <div style={{ background:'rgba(255,255,255,0.02)', borderRadius:7, padding:'6px 9px', border:'1px solid rgba(255,255,255,0.03)' }}>
+              <div style={{ display:'flex', justifyContent:'space-between', marginBottom:2 }}>
+                <span style={{ fontSize:10, color:'#475569' }}>Kalman filter</span>
+                <span style={{ fontSize:10, fontWeight:700, color:m.kalman?.trend==='UP'?'#34d399':m.kalman?.trend==='DOWN'?'#f87171':'#94a3b8' }}>
+                  {m.kalman?.trend||'—'}</span>
+              </div>
+              <div style={{ display:'flex', gap:8, fontSize:11, marginBottom:3 }}>
+                <span style={{ color:'#94a3b8' }}>Price <b style={{ color:'#e6faff' }}>${m.kalman?.price.toFixed(1)??'—'}</b></span>
+                <span style={{ color:'#94a3b8' }}>Vel <b style={{ color:(m.kalman?.velocityPct||0)>0?'#34d399':'#f87171' }}>
+                  {m.kalman?.velocityPct?.toFixed(4)??'—'}%</b></span>
+              </div>
+              <Bar val={sc.kalmanScore} color={(sc.kalmanScore||0)>=0?'#34d399':'#f87171'}/>
+            </div>
+
+            {/* Microstructure */}
+            <div style={{ background:'rgba(255,255,255,0.02)', borderRadius:7, padding:'6px 9px', border:'1px solid rgba(255,255,255,0.03)' }}>
+              <div style={{ display:'flex', justifyContent:'space-between', marginBottom:2 }}>
+                <span style={{ fontSize:10, color:'#475569' }}>Microstructure</span>
+                <span style={{ fontSize:10, fontWeight:700, color:m.micro?.bias==='BUY'?'#34d399':m.micro?.bias==='SELL'?'#f87171':'#94a3b8' }}>
+                  {m.micro?.bias||'—'}{m.micro?.absorbed?' · ABS':''}
+                </span>
+              </div>
+              <div style={{ display:'flex', gap:8, fontSize:11, marginBottom:3 }}>
+                <span style={{ color:'#94a3b8' }}>δ <b style={{ color:(m.micro?.deltaRatio||0)>0?'#34d399':'#f87171' }}>
+                  {m.micro?.deltaRatio?.toFixed(3)??'—'}</b></span>
+                <span style={{ color:'#94a3b8' }}>OB <b style={{ color:(m.micro?.obImbalance||0)>0?'#34d399':'#f87171' }}>
+                  {m.micro?.obImbalance?.toFixed(3)??'—'}</b></span>
+              </div>
+              <Bar val={sc.microScore} color={(sc.microScore||0)>=0?'#34d399':'#f87171'}/>
+            </div>
+
+            {/* VP levels */}
+            {vpData && (
+              <div style={{ background:'rgba(255,255,255,0.02)', borderRadius:7, padding:'6px 9px', border:'1px solid rgba(255,255,255,0.03)' }}>
+                <div style={{ fontSize:10, color:'#475569', marginBottom:4 }}>Volume profile levels</div>
+                <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr 1fr', gap:4 }}>
+                  {[['VAH',vpData.vah,'#f87171'],['POC',vpData.poc,'#fbbf24'],['VAL',vpData.val,'#34d399']].map(([l,v,c])=>(
+                    <div key={l} style={{ textAlign:'center', background:'rgba(0,0,0,0.15)', borderRadius:5, padding:'4px' }}>
+                      <div style={{ fontSize:9, color:c }}>{l}</div>
+                      <div style={{ fontSize:11, fontWeight:700, color:'#e6faff' }}>${v}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
           </div>
         )}
 
-        {/* Indicators */}
-        <div style={{ display:'grid', gridTemplateColumns:'repeat(3,1fr)', gap:4 }}>
-          {[
-            ['RSI', rsiVal?rsiVal.toFixed(1):'—', rsiVal>70?'#f87171':rsiVal<35?'#34d399':'#94a3b8'],
-            ['ATR', atr?`$${atr.toFixed(0)}`:'—', '#9ddfff'],
-            ['EMA21', trend?.ema21?trend.ema21.toFixed(0):'—', trendCol(trend?.dir)],
-          ].map(([l,v,c]) => (
-            <div key={l} style={{ background:'rgba(255,255,255,0.02)', borderRadius:6, padding:'5px 6px', textAlign:'center', border:'1px solid rgba(255,255,255,0.03)' }}>
-              <div style={{ fontSize:9, color:'#475569' }}>{l}</div>
-              <div style={{ fontSize:12, fontWeight:700, color:c }}>{v}</div>
-            </div>
-          ))}
-        </div>
+        {/* Reason */}
+        {lastResult?.reason && (
+          <div style={{ fontSize:10, color:'#5b7e93', background:'rgba(0,0,0,0.18)',
+            padding:'5px 8px', borderRadius:5, lineHeight:1.7 }}>{lastResult.reason}</div>
+        )}
 
         {/* Stats */}
-        <div style={{ display:'grid', gridTemplateColumns:'repeat(4,1fr)', gap:4 }}>
-          {[
-            ['Trades', stats.trades, '#9ddfff'],
-            ['Wins',   stats.wins,   '#34d399'],
-            ['Loss',   stats.losses, '#f87171'],
-            ['Win%', winRate!=null?`${winRate}%`:'—', winRate!=null?(winRate>=50?'#34d399':'#f87171'):'#94a3b8'],
-          ].map(([l,v,c]) => (
-            <div key={l} style={{ background:'rgba(255,255,255,0.02)', borderRadius:6, padding:'5px 5px', textAlign:'center', border:'1px solid rgba(255,255,255,0.03)' }}>
+        <div style={{ display:'grid', gridTemplateColumns:'repeat(5,1fr)', gap:3 }}>
+          {[['Trades',stats.trades,'#9ddfff'],['Wins',stats.wins,'#34d399'],['Loss',stats.losses,'#f87171'],
+            ['Win%',winRate!=null?`${winRate}%`:'—',winRate!=null?(winRate>=50?'#34d399':'#f87171'):'#94a3b8'],
+            ['Sweeps',stats.sweepTrades,'#fbbf24']].map(([l,v,c])=>(
+            <div key={l} style={{ background:'rgba(255,255,255,0.02)', borderRadius:5, padding:'4px',
+              textAlign:'center', border:'1px solid rgba(255,255,255,0.03)' }}>
               <div style={{ fontSize:9, color:'#475569', marginBottom:1 }}>{l}</div>
-              <div style={{ fontSize:13, fontWeight:800, color:c }}>{v}</div>
+              <div style={{ fontSize:12, fontWeight:800, color:c }}>{v}</div>
             </div>
           ))}
         </div>
-
-        {/* PnL */}
         <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center' }}>
           <span style={{ fontSize:11, color:'#94a3b8' }}>Total PnL</span>
           <span style={{ fontWeight:800, fontSize:15, color:stats.totalPnl>=0?'#00ffe1':'#ff7ab0' }}>
-            {stats.totalPnl>=0?'+':''}${stats.totalPnl.toFixed(2)}
-          </span>
+            {stats.totalPnl>=0?'+':''}${stats.totalPnl.toFixed(2)}</span>
         </div>
 
         {/* Controls */}
         <div style={{ display:'flex', gap:6 }}>
           {!running
-            ? <button className="btn btn-green" style={{ flex:1, fontSize:11 }} onClick={() => start()}>▶ Start</button>
+            ? <button className="btn btn-green" style={{ flex:1, fontSize:11 }} onClick={start}>▶ Start</button>
             : <button className="btn btn-red"   style={{ flex:1, fontSize:11 }} onClick={stop}>■ Stop</button>}
           <button className="btn" style={{ fontSize:11 }} onClick={reset}>Reset</button>
-          <button className={`btn ${showLevels?'btn-on':''}`} style={{ fontSize:11 }} onClick={() => setShowLevels(l=>!l)}>
-            Levels ({allZones.length})
-          </button>
+          <button className={`btn ${showLevels?'btn-on':''}`} style={{ fontSize:11 }}
+            onClick={() => setShowLevels(l=>!l)}>Levels ({allZones.length})</button>
         </div>
 
-        {/* Dynamic levels panel */}
+        {/* Levels */}
         {showLevels && (
-          <div style={{ background:'rgba(0,0,0,0.22)', borderRadius:7, padding:'8px 10px', border:'1px solid rgba(255,255,255,0.04)' }}>
-            <div style={{ fontSize:9, color:'#475569', marginBottom:6, letterSpacing:'.1em' }}>
-              ALL LEVELS — role assigned dynamically from current price ${markPrice?.toFixed(0)}
+          <div style={{ background:'rgba(0,0,0,0.2)', borderRadius:7, padding:'8px', border:'1px solid rgba(255,255,255,0.04)' }}>
+            <div style={{ fontSize:9, color:'#475569', marginBottom:5 }}>
+              Swing + VP unified pool · role dynamic · ${markPrice?.toFixed(0)} now
             </div>
             <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:8 }}>
-              {[
-                ['↑ RESISTANCE (above price)', resistances, '#f87171'],
-                ['↓ SUPPORT (below price)',    supports,    '#34d399'],
-              ].map(([title, zones, col]) => (
-                <div key={title}>
-                  <div style={{ fontSize:9, color:col, marginBottom:4 }}>{title}</div>
-                  {zones.slice(0, 6).map((z, i) => (
+              {[['↑ RESISTANCE', resistances, '#f87171'], ['↓ SUPPORT', supports, '#34d399']].map(([t,zs,col])=>(
+                <div key={t}>
+                  <div style={{ fontSize:9, color:col, marginBottom:4 }}>{t}</div>
+                  {zs.slice(0,6).map((z,i)=>(
                     <div key={i} style={{ display:'flex', justifyContent:'space-between', fontSize:11,
-                      padding:'3px 0', borderBottom:'1px solid rgba(255,255,255,0.025)',
-                      color: i === 0 ? col : '#7f9fb5', fontWeight: i === 0 ? 700 : 400 }}>
+                      padding:'2px 0', borderBottom:'1px solid rgba(255,255,255,0.03)',
+                      color:i===0?col:'#7f9fb5', fontWeight:i===0?700:400 }}>
                       <span>${z.price.toFixed(1)}</span>
-                      <span style={{ fontSize:9, color:'#334155' }}>×{z.strength} {z.distPct < 0.5 ? '⚡' : ''}</span>
+                      <span style={{ fontSize:9, color:'#334155' }}>{z.source} ×{z.strength}</span>
                     </div>
                   ))}
                 </div>
               ))}
             </div>
-            {atLevel.length > 0 && (
-              <div style={{ marginTop:8, padding:'5px 8px', borderRadius:5,
-                background:'rgba(251,191,36,0.06)', border:'1px solid rgba(251,191,36,0.15)',
-                fontSize:10, color:'#fbbf24' }}>
-                AT LEVEL NOW: {atLevel.map(z => `$${z.price.toFixed(0)}`).join(', ')} — role determined by price action
-              </div>
-            )}
-            <div style={{ marginTop:6, fontSize:9, color:'#1e3a5f', lineHeight:1.6 }}>
-              Levels have no fixed label. Old resistance becomes support once price breaks above it. ×N = pivot touches.
-            </div>
           </div>
         )}
 
         {/* Log */}
-        <div style={{ maxHeight:110, overflowY:'auto', display:'flex', flexDirection:'column', gap:2,
+        <div style={{ maxHeight:115, overflowY:'auto', display:'flex', flexDirection:'column', gap:2,
           background:'rgba(0,0,0,0.18)', borderRadius:6, padding:'5px 8px', border:'1px solid rgba(255,255,255,0.03)' }}>
-          {botLog.length === 0 && <div style={{ color:'#334155', fontSize:10 }}>Select strategy → Start.</div>}
-          {botLog.map((l, i) => (
-            <div key={i} style={{ display:'flex', gap:7, fontSize:10, lineHeight:1.55 }}>
+          {botLog.length===0 && <div style={{ color:'#334155', fontSize:10 }}>Press Start.</div>}
+          {botLog.map((l,i)=>(
+            <div key={i} style={{ display:'flex', gap:7, fontSize:10, lineHeight:1.5 }}>
               <span style={{ color:'#1e3a5f', flexShrink:0 }}>{l.ts}</span>
-              <span style={{ color: l.type==='success'?'#34d399':l.type==='danger'?'#f87171':l.type==='warn'?'#fbbf24':l.type==='muted'?'#2d4a5e':'#7f9fb5', wordBreak:'break-word' }}>{l.msg}</span>
+              <span style={{ color:l.type==='success'?'#34d399':l.type==='danger'?'#f87171':
+                l.type==='warn'?'#fbbf24':l.type==='muted'?'#2d4a5e':'#7f9fb5', wordBreak:'break-word' }}>{l.msg}</span>
             </div>
           ))}
         </div>
-
-        <div style={{ fontSize:9, color:'#1e3a5f', lineHeight:1.6 }}>
-          Role reversal is live: resistance → support on breakout. TP/SL always set to real levels, never ATR multiples.
+        <div style={{ fontSize:9, color:'#1e3a5f', lineHeight:1.7 }}>
+          Levels gate entries. Sweep overrides quant. Dynamic TP adjusts to hidden resistance. Trail SL ratchets with ATR. All exits respect institutional levels.
         </div>
       </div>
     </div>
@@ -700,8 +924,8 @@ export const BotPanel = forwardRef(function BotPanel(
 });
 
 /*
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  INTEGRATION — no changes from v2 needed.
-  Just replace the file. ref={botRef} stays.
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  INTEGRATION — same as v4, no changes needed.
+  trades + orderBook already passed in.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 */

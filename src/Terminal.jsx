@@ -1078,6 +1078,7 @@ export default function Terminal() {
                 <div style={{ fontWeight:800 }}>${equity.toFixed(2)}</div>
               </div>
             </div>
+
             {positions.length === 0 && <div style={{ color:'#5b7e93' }}>No open positions</div>}
             {positions.map(p => (
               <div key={p.id} className="pos-card">
@@ -1097,8 +1098,19 @@ export default function Terminal() {
                     <button className="btn" onClick={() => closePosition(p.id)}>Close</button>
                   </div>
                 </div>
+                
               </div>
+              
             ))}
+                         <BotPanel
+  candles={candles}
+  ref={botRef}
+  markPrice={markPrice}
+  openPosition={openPosition}
+  closePosition={closePosition}
+  positions={positions}
+  log={log}
+/>
           </div>
         
           {/* Compact Trade section merged into right panel to reduce clutter */}
@@ -1141,16 +1153,13 @@ export default function Terminal() {
         </aside>
 
   {/* left-bottom clock widget (current time) */}
+  
   <div className="left-clock"><div className="time">{new Date(nowTick).toLocaleTimeString()}</div><div className="date">{new Date(nowTick).toLocaleDateString()}</div></div>
 
       
 
       
-      {/* Transactions panel toggle + panel */}
-      <div className="tx-toggle">
-        <button className="btn" onClick={() => setShowTxPanel(s => !s)}>{showTxPanel ? 'Hide Transactions' : 'Show Transactions'}</button>
-      </div>
-
+    
       {showTxPanel && (
         <div className="tx-panel">
           <div className="tx-header">
@@ -1183,15 +1192,7 @@ export default function Terminal() {
       )}
 
       </div>
-      <BotPanel
-  candles={candles}
-  ref={botRef}
-  markPrice={markPrice}
-  openPosition={openPosition}
-  closePosition={closePosition}
-  positions={positions}
-  log={log}
-/>
+
     </div>
     
   );
