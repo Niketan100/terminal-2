@@ -811,13 +811,13 @@ export default function Terminal() {
                 <button className={`btn ${chartRes==='1m' ? 'btn-on' : ''}`} onClick={async () => {
                   const next = '1m';
                   setChartRes(next);
-                  const ok = await fetchHistory(300, next);
+                  const ok = await fetchHistory(1200, next);
                   if (!ok) log(`Failed to load ${next} history`, 'warn'); else log(`Switched chart to ${next}`, 'success');
                 }}>1m</button>
                 <button className={`btn ${chartRes==='5m' ? 'btn-on' : ''}`} onClick={async () => {
                   const next = '5m';
                   setChartRes(next);
-                  const ok = await fetchHistory(300, next);
+                  const ok = await fetchHistory(1200, next);
                   if (!ok) log(`Failed to load ${next} history`, 'warn'); else log(`Switched chart to ${next}`, 'success');
                 }}>5m</button>
               </div>
@@ -1110,6 +1110,8 @@ export default function Terminal() {
   closePosition={closePosition}
   positions={positions}
   log={log}
+  trades={trades}
+  orderBook={orderBook}
 />
           </div>
         
