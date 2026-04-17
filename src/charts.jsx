@@ -202,6 +202,27 @@ export function CandleChart({ candles, ind, crosshair, padLeft = 0, padRight = 0
         ctx.lineWidth = 1; ctx.strokeRect(X(i) - cw / 2, y1, cw, rh);
       }
     });
+
+    // ── Big Trades (Order Flow) ───────────────────────────────────────────────
+    candles.forEach((d, i) => {
+      if (d.bigTrades && d.bigTrades.length > 0) {
+        d.bigTrades.forEach(trade => {
+          const x = X(i);
+          const y = Y(trade.price);
+          ctx.beginPath();
+          // make size of dot relative to trade size, but with a min/max
+          const r = Math.max(2.5, Math.min(8, Math.sqrt(trade.size) / 20));
+          ctx.arc(x, y, r, 0, Math.PI * 2);
+          
+          const isBuy = trade.side === 'buy';
+          ctx.fillStyle = isBuy ? 'rgba(0, 255, 150, 0.85)' : 'rgba(255, 80, 130, 0.85)';
+          ctx.fill();
+          ctx.strokeStyle = isBuy ? 'rgba(0, 100, 80, 0.9)' : 'rgba(100, 0, 30, 0.9)';
+          ctx.lineWidth = 1;
+          ctx.stroke();
+        });
+      }
+    });
   } else {
     // Line chart: single polyline through closes, with a subtle area fill and glow
     ctx.beginPath();
